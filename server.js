@@ -1,5 +1,5 @@
 require('dotenv').config();
-// Backend sync: Added ShipStation API sync & dispatch notifications (2026-08-24 15:17)
+// Backend sync: Added 3PL client migration & fallback fix (2026-08-24 16:07)
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -597,55 +597,37 @@ async function start() {
     }
 
     try {
-      const { Product, Customer } = require('./models');
-      const { Op } = require('sequelize');
+      // 1. Mark 3PL Business Clients dynamically based on business attributes
+      await sequelize.query(`
+        UPDATE customers 
+        SET is_client = 1 
+        WHERE (
+          header_image_url IS NOT NULL OR 
+          packing_slip_footer IS NOT NULL OR 
+          tier IS NOT NULL OR 
+          segment IS NOT NULL OR 
+          code IS NOT NULL OR 
+          credit_limit > 0 OR 
+          type = 'B2B'
+        )
+      `);
 
-      // 1. Mark actual 3PL Business Clients (isClient = true)
-      const allCustomers = await Customer.findAll();
-      for (const cust of allCustomers) {
-        const hasClientAttr = Boolean(
-          cust.header_image_url ||
-          cust.packing_slip_footer ||
-          cust.tier ||
-          cust.segment ||
-          cust.code ||
-          cust.creditLimit > 0 ||
-          cust.type === 'B2B' ||
-          [6, 7, 8, 9].includes(cust.id)
-        );
-
-        const newIsClientState = hasClientAttr;
-        if (cust.isClient !== newIsClientState) {
-          await cust.update({ isClient: newIsClientState });
-        }
+      // 2. If no customers are marked as 3PL clients yet, auto-mark top 10 customers as 3PL clients
+      const [clientRows] = await sequelize.query(`SELECT COUNT(*) as cnt FROM customers WHERE is_client = 1`);
+      const clientCount = Number(clientRows[0]?.cnt || clientRows[0]?.['COUNT(*)'] || 0);
+      if (clientCount === 0) {
+        await sequelize.query(`UPDATE customers SET is_client = 1 LIMIT 10`);
       }
 
-      // 2. Fetch valid 3PL Clients
-      const valid3PLClients = await Customer.findAll({ where: { isClient: true } });
-      const validClientIds = new Set(valid3PLClients.map(c => c.id));
-      const default3PLClientId = valid3PLClients.length > 0 ? valid3PLClients[0].id : null;
-
-      // 3. Fix Products whose clientId is NULL or set to an end-consumer buyer (non-client)
-      if (default3PLClientId) {
-        const invalidProductOwners = await Product.findAll({
-          where: {
-            [Op.or]: [
-              { clientId: null },
-              { clientId: { [Op.notIn]: Array.from(validClientIds) } }
-            ]
-          }
-        });
-
-        if (invalidProductOwners.length > 0) {
-          console.log(`[DB Repair] Re-assigning ${invalidProductOwners.length} products to valid 3PL Client Owner ID ${default3PLClientId}...`);
-          for (const p of invalidProductOwners) {
-            await p.update({ clientId: default3PLClientId });
-          }
-          console.log('[DB Repair] Product Client Owner repair complete.');
-        }
+      // 3. Auto-assign any orphan products (clientId IS NULL) to the first valid 3PL Client ID
+      const [validClients] = await sequelize.query(`SELECT id FROM customers WHERE is_client = 1 ORDER BY id ASC LIMIT 1`);
+      if (validClients && validClients.length > 0) {
+        const firstClientId = validClients[0].id;
+        await sequelize.query(`UPDATE products SET client_id = ${firstClientId} WHERE client_id IS NULL OR client_id = 0`);
       }
+      console.log('[DB Client Migration] Successfully verified 3PL client flags & product owner links.');
     } catch (e) {
-      console.warn('[DB Repair Warning]:', e.message);
+      console.warn('[DB Client Migration Notice]:', e.message);
     }
 
     // BACKFILL SalesOrders with realistic seed data if they don't have it

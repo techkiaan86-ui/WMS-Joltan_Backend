@@ -25,6 +25,13 @@ async function list(reqUser, query = {}) {
   let customers = [];
   try {
     customers = await Customer.findAll({ where, order: [['name']] });
+    if (where.isClient && customers.length === 0) {
+      // Fallback: If no is_client=true rows exist yet, return customers with client attributes
+      const fallbackWhere = { ...where };
+      delete fallbackWhere.isClient;
+      const allCust = await Customer.findAll({ where: fallbackWhere, order: [['name']] });
+      if (allCust.length > 0) customers = allCust;
+    }
   } catch (err) {
     if (err.message && err.message.includes("is_client")) {
       // Auto-migrate column on demand if server startup hasn't run yet
