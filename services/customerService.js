@@ -119,5 +119,23 @@ async function remove(id, reqUser) {
   await customer.destroy();
   return { message: 'Customer deleted' };
 }
+async function listEndCustomers(reqUser, query = {}) {
+  const { EndCustomer } = require('../models');
+  const where = {};
+  if (reqUser.role !== 'super_admin') where.companyId = reqUser.companyId;
+  else if (query.companyId) where.companyId = query.companyId;
 
-module.exports = { list, getById, create, update, remove };
+  if (query.search) {
+    const term = `%${query.search}%`;
+    where[Op.or] = [
+      { name: { [Op.like]: term } },
+      { email: { [Op.like]: term } },
+      { phone: { [Op.like]: term } },
+      { postcode: { [Op.like]: term } }
+    ];
+  }
+  const endCustomers = await EndCustomer.findAll({ where, order: [['createdAt', 'DESC']] });
+  return endCustomers.map(c => c.get({ plain: true }));
+}
+
+module.exports = { list, getById, create, update, remove, listEndCustomers };

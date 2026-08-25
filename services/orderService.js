@@ -1,4 +1,4 @@
- const { SalesOrder, OrderItem, Product, Customer, Company, PickList, PickListItem, PackingTask, Warehouse, Shipment, ProductStock, CourierMapping, sequelize } = require('../models');
+const { SalesOrder, OrderItem, Product, Customer, Company, PickList, PickListItem, PackingTask, Warehouse, Shipment, ProductStock, CourierMapping, sequelize } = require('../models');
 const { Op } = require('sequelize');
 const inventoryService = require('./inventoryService');
 
@@ -23,10 +23,14 @@ async function list(reqUser, query = {}) {
   }
 
   // Filter: Client
-  if (reqUser.clientId) {
-    andConditions.push({ customerId: reqUser.clientId });
-  } else if (query.clientId && query.clientId !== 'all') {
-    andConditions.push({ customerId: query.clientId });
+  const selectedClientId = reqUser.clientId || (query.clientId && query.clientId !== 'all' ? query.clientId : null);
+  if (selectedClientId) {
+    andConditions.push({
+      [Op.or]: [
+        { customerId: selectedClientId },
+        { '$OrderItems.Product.client_id$': selectedClientId }
+      ]
+    });
   }
 
   // Filter: Order Status
@@ -264,11 +268,16 @@ async function list(reqUser, query = {}) {
     include: [
       { association: 'Company', attributes: ['id', 'name', 'code'] },
       { association: 'Client', attributes: ['id', 'name', 'code', 'email', 'phone', 'contactPerson', 'address', 'city', 'state', 'country', 'postcode', 'header_image_url'] },
+      { association: 'EndCustomer', required: false },
       {
         association: 'OrderItems',
         required: false,
         include: [
-          { association: 'Product', attributes: ['id', 'name', 'sku', 'weight', 'weightUnit'] },
+          {
+            association: 'Product',
+            attributes: ['id', 'name', 'sku', 'weight', 'weightUnit', 'clientId'],
+            include: [{ association: 'Client', attributes: ['id', 'name', 'code', 'is_client'] }]
+          },
           { association: 'Warehouse', attributes: ['id', 'name'] },
           { association: 'Location', attributes: ['id', 'name'] }
         ]
@@ -344,7 +353,7 @@ async function getById(id, reqUser) {
         try {
           const { OrderItem } = require('../models');
           OrderItem.update({ unitPrice: price }, { where: { id: item.id } });
-        } catch (_) {}
+        } catch (_) { }
       }
 
       return {
@@ -638,7 +647,7 @@ async function create(data, reqUser) {
           }, { transaction: t });
         }
       }
-      
+
       await order.update({
         totalAmount: Number(orderGrossTotal.toFixed(2)),
         netAmount: Number(orderNetTotal.toFixed(2)),
@@ -717,7 +726,7 @@ async function update(id, data, reqUser) {
       for (const item of order.OrderItems) {
         const whId = item.warehouseId || order.PickLists?.[0]?.warehouseId;
         if (!whId) continue;
-        
+
         if (item.locationId) {
           const stockRow = await ProductStock.findOne({
             where: {
@@ -774,7 +783,7 @@ async function update(id, data, reqUser) {
       internalNotes: data.internalNotes !== undefined ? data.internalNotes : order.internalNotes,
       customField2: data.customField2 !== undefined ? data.customField2 : order.customField2,
       customField3: data.customField3 !== undefined ? data.customField3 : order.customField3,
-      
+
       recipientName: data.recipientName !== undefined ? data.recipientName : order.recipientName,
       addressLine1: data.addressLine1 !== undefined ? data.addressLine1 : order.addressLine1,
       addressLine2: data.addressLine2 !== undefined ? data.addressLine2 : order.addressLine2,
@@ -1154,7 +1163,7 @@ async function bulkAction(data, reqUser) {
         const t = await sequelize.transaction();
         try {
           await order.update({ status: 'DISPATCHED' }, { transaction: t });
-          
+
           let shipment = await Shipment.findOne({ where: { salesOrderId: order.id }, transaction: t });
           if (!shipment) {
             shipment = await Shipment.create({
@@ -1208,7 +1217,7 @@ async function bulkAction(data, reqUser) {
         try {
           await order.update({ status: 'ALLOCATED' }, { transaction: t });
           await t.commit();
-          
+
           const allocationService = require('./allocationService');
           await allocationService.allocateOrder(order.id);
           affected++;
@@ -1300,7 +1309,7 @@ async function bulkAction(data, reqUser) {
           if (existingPickLists.length > 0) {
             for (const pl of existingPickLists) {
               await pl.update({ status: 'PICKED' }, { transaction: t });
-              
+
               const items = await PickListItem.findAll({ where: { pickListId: pl.id }, transaction: t });
               for (const item of items) {
                 await item.update({ quantityPicked: item.quantityRequired }, { transaction: t });
@@ -1504,8 +1513,8 @@ async function importCsv(rows, reqUser) {
 
       maxSeq += 1;
       const sequenceNumber = maxSeq;
-      const finalOrderNumber = orderData.orderNumber 
-        ? orderData.orderNumber 
+      const finalOrderNumber = orderData.orderNumber
+        ? orderData.orderNumber
         : `ORD-${String(sequenceNumber).padStart(4, '0')}`;
 
       const salesOrder = await SalesOrder.create({
@@ -1628,7 +1637,7 @@ async function importCsv(rows, reqUser) {
 function drawCode39Barcode(doc, value, x, y, height = 30, widthPerModule = 0.75) {
   // Convert value to uppercase and sanitize
   const cleanVal = '*' + String(value || '').toUpperCase().replace(/[^0-9A-Z\-.\s$/+%]/g, '') + '*';
-  
+
   const patterns = {
     '0': '101001101101', '1': '110100101011', '2': '101100101011', '3': '110110010101',
     '4': '101001101011', '5': '110100110101', '6': '101100110101', '7': '101001011011',
@@ -1768,13 +1777,13 @@ async function generateDespatchNotePdf(id, reqUser) {
   // Left Column: Ship To Address
   doc.fontSize(10).font('Helvetica-Bold').fillColor('#555555').text('SHIP TO:', 40, infoTop);
   doc.fontSize(9).font('Helvetica').fillColor('#111111');
-  
+
   const recipientName = order.recipientName || order.Client?.name || '-';
   doc.text(recipientName, 40, doc.y + 3);
   if (order.addressLine1) doc.text(order.addressLine1, 40);
   if (order.addressLine2) doc.text(order.addressLine2, 40);
   if (order.addressLine3) doc.text(order.addressLine3, 40);
-  
+
   let townCountyPostcode = [order.town, order.county, order.postcode].filter(Boolean).join(', ');
   if (townCountyPostcode) {
     doc.text(townCountyPostcode, 40);
@@ -1785,7 +1794,7 @@ async function generateDespatchNotePdf(id, reqUser) {
     const fallbackLine = [fallbackCity, fallbackState, fallbackPostcode].filter(Boolean).join(', ');
     if (fallbackLine) doc.text(fallbackLine, 40);
   }
-  
+
   const countryStr = order.country || order.Client?.country || '';
   if (countryStr) doc.text(countryStr.toUpperCase(), 40);
 
@@ -1800,7 +1809,7 @@ async function generateDespatchNotePdf(id, reqUser) {
   const rightColumnX = 320;
   doc.fontSize(10).font('Helvetica-Bold').fillColor('#555555').text('ORDER DETAILS:', rightColumnX, infoTop);
   doc.fontSize(9).font('Helvetica').fillColor('#444444');
-  
+
   let detailY = infoTop + 15;
   const drawDetailRow = (label, value) => {
     doc.font('Helvetica-Bold').fillColor('#555555').text(label, rightColumnX, detailY, { width: 100, continued: true });
@@ -1811,14 +1820,14 @@ async function generateDespatchNotePdf(id, reqUser) {
   drawDetailRow('Order Number: ', order.orderNumber);
   drawDetailRow('Seq Number: ', order.sequenceNumber ? String(order.sequenceNumber) : '-');
   if (order.externalRef) drawDetailRow('External Ref: ', order.externalRef);
-  
+
   const orderDateStr = order.orderDate || (order.createdAt ? new Date(order.createdAt).toLocaleDateString('en-GB') : '-');
   drawDetailRow('Order Date: ', orderDateStr);
 
   const courierName = order.courierName || '-';
   const courierService = order.courierService || '-';
   drawDetailRow('Courier: ', `${courierName} (${courierService})`);
-  
+
   // Render Barcode of Order Number
   const barcodeY = detailY + 10;
   drawCode39Barcode(doc, order.orderNumber, rightColumnX, barcodeY, 30, 0.75);
@@ -1855,7 +1864,7 @@ async function generateDespatchNotePdf(id, reqUser) {
 
     const rowY = doc.y;
     doc.fontSize(8.5).font('Helvetica').fillColor('#111111');
-    
+
     const sku = item.Product?.sku || '-';
     const name = item.Product?.name || item.productName || '-';
     const qty = item.quantity || 0;
@@ -1863,7 +1872,7 @@ async function generateDespatchNotePdf(id, reqUser) {
     doc.text(sku, 40, rowY, { width: 100, ellipsis: true });
     doc.text(name, 150, rowY, { width: 280, ellipsis: true });
     doc.text(String(qty), 440, rowY, { width: 60, align: 'right' });
-    
+
     // Draw tick box
     doc.rect(525, rowY - 1, 10, 10).strokeColor('#999999').lineWidth(0.5).stroke();
 

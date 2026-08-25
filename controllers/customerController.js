@@ -47,5 +47,13 @@ async function remove(req, res, next) {
     next(err);
   }
 }
+async function listEndCustomers(req, res, next) {
+  try {
+    const data = await customerService.listEndCustomers(req.user, req.query);
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+}
 
-module.exports = { list, getById, create, update, remove };
+module.exports = { list, getById, create, update, remove, listEndCustomers };

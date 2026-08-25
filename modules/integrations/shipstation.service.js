@@ -257,39 +257,39 @@ async function getOrCreateInventory(productId, warehouseId, companyId) {
   }
 }
 
-async function getOrCreateCustomer(recipientName, email, phone, addressLine1, town, county, postcode, country, companyId) {
+async function getOrCreateEndCustomer(recipientName, email, phone, addressLine1, town, county, postcode, country, companyId, clientId) {
   if (!recipientName || recipientName === 'Customer') return null;
+  const { EndCustomer } = require('../../models');
 
-  let customer = null;
+  let endCustomer = null;
   if (email) {
-    customer = await Customer.findOne({ where: { email, companyId: companyId || 1 } });
+    endCustomer = await EndCustomer.findOne({ where: { email, companyId: companyId || 1 } });
   }
-  if (!customer && recipientName) {
-    customer = await Customer.findOne({ where: { name: recipientName, companyId: companyId || 1 } });
+  if (!endCustomer && recipientName) {
+    endCustomer = await EndCustomer.findOne({ where: { name: recipientName, companyId: companyId || 1 } });
   }
 
-  if (!customer) {
+  if (!endCustomer) {
     try {
-      customer = await Customer.create({
+      endCustomer = await EndCustomer.create({
         companyId: companyId || 1,
+        clientId: clientId || null,
         name: recipientName,
         email: email || null,
         phone: phone || null,
-        address: `${addressLine1} ${town}`.trim(),
-        city: town || null,
-        state: county || null,
+        addressLine1: addressLine1 || null,
+        town: town || null,
+        county: county || null,
         postcode: postcode || null,
         country: country || 'UNITED KINGDOM',
-        isClient: false,
         status: 'ACTIVE'
       });
-      console.log(`[Auto Customer Create] Created Customer in WMS: ${recipientName} (${email || 'No email'})`);
+      console.log(`[Auto EndCustomer Create] Saved buyer to end_customers table: ${recipientName} (${email || 'No email'})`);
     } catch (err) {
-      console.error('[Auto Customer Create Warning]:', err.message);
+      console.error('[Auto EndCustomer Create Warning]:', err.message);
     }
   }
-
-  return customer;
+  return endCustomer;
 }
 
 async function getOrCreateProductFromChannelItem(item, companyId, productImageUrl, clientId = null) {
@@ -1148,8 +1148,8 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
       const customField2 = advOpts.customField2 || advOpts.custom_field2 || ssOrder.customField2 || ssOrder.custom_field2 || null;
       const customField3 = advOpts.customField3 || advOpts.custom_field3 || ssOrder.customField3 || ssOrder.custom_field3 || null;
 
-      // Auto-create/link Customer & Warehouse in WMS DB
-      const customer = await getOrCreateCustomer(recipientName, email, phone, addressLine1, town, county, postcode, country, companyId || 1);
+      // Auto-create/link EndCustomer & Warehouse in WMS DB
+      const endCustomer = await getOrCreateEndCustomer(recipientName, email, phone, addressLine1, town, county, postcode, country, companyId || 1, storeClientId);
       const rawWhId = ssOrder.warehouse_id || ssOrder.warehouseId || ssOrder.advancedOptions?.warehouseId;
       const rawWhName = ssOrder.warehouse_name || ssOrder.warehouseName || ssOrder.advancedOptions?.warehouseName;
       const warehouse = await getOrCreateWarehouse(rawWhId, companyId || 1, rawWhName);
@@ -1179,7 +1179,8 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
       if (existingOrder) {
         const updates = {};
         if (parseFloat(existingOrder.totalAmount || 0) === 0 && totalAmount > 0) updates.totalAmount = totalAmount;
-        if (!existingOrder.customerId && customer) updates.customerId = customer.id;
+        if (!existingOrder.endCustomerId && endCustomer) updates.endCustomerId = endCustomer.id;
+        if (!existingOrder.clientId && storeClientId) updates.clientId = storeClientId;
         if (!existingOrder.notes && generalNotes) updates.notes = generalNotes;
         if (!existingOrder.notesFromBuyer && notesFromBuyer) updates.notesFromBuyer = notesFromBuyer;
         if (!existingOrder.notesToBuyer && notesToBuyer) updates.notesToBuyer = notesToBuyer;
@@ -1205,6 +1206,9 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
                   { productImageUrl: productImageUrl },
                   { where: { salesOrderId: existingOrder.id, productId: product.id } }
                 );
+                if (product.clientId && !existingOrder.clientId) {
+                  await existingOrder.update({ clientId: product.clientId });
+                }
               }
             }
           }
@@ -1214,7 +1218,8 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
       } else {
         existingOrder = await SalesOrder.create({
           companyId: companyId || 1,
-          customerId: customer ? customer.id : null,
+          endCustomerId: endCustomer ? endCustomer.id : null,
+          clientId: storeClientId || null,
           warehouseId: warehouse ? warehouse.id : null,
           orderNumber,
           shipstationOrderId,

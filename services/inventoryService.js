@@ -10,7 +10,7 @@ const { Product, Category, ProductStock, Warehouse, Company, Supplier, Inventory
         SELECT id FROM categories WHERE LOWER(name) IN ('demo', 'general imports', 'cat-gen') OR LOWER(name) LIKE '%demo%'
       );
     `);
-    console.log('Successfully cleared demo category_id from existing products DB rows!');
+    // console.log('Successfully cleared demo category_id from existing products DB rows!');
   } catch (_) { }
 })();
 const { Op, Sequelize } = require('sequelize');
@@ -253,7 +253,7 @@ async function listProducts(reqUser, query = {}) {
       if (!defaultClient) {
         defaultClient = await Customer.create({
           companyId: nullClientProducts[0].companyId,
-          name: 'Default Client',
+          name: '',
           code: 'DFTCL',
           status: 'ACTIVE'
         });

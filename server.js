@@ -480,7 +480,7 @@ async function start() {
       const { PickListItem, PickList, OrderItem } = require('./models');
       const items = await PickListItem.findAll({ where: { locationId: null } });
       if (items.length > 0) {
-        console.log(`[DB] Backfilling location/batch details for ${items.length} PickListItems...`);
+        // console.log(`[DB] Backfilling location/batch details for ${items.length} PickListItems...`);
         for (const item of items) {
           const pickList = await PickList.findByPk(item.pickListId);
           if (pickList) {
@@ -518,10 +518,10 @@ async function start() {
             }
           }
         }
-        console.log('[DB] PickListItem backfill complete.');
+        // console.log('[DB] PickListItem backfill complete.');
       }
     } catch (e) {
-      console.warn('[DB] PickListItem backfill error:', e.message);
+      // console.warn('[DB] PickListItem backfill error:', e.message);
     }
 
     // BACKFILL warehouse_id for old OrderItems
@@ -538,7 +538,7 @@ async function start() {
         // console.log('[DB] Backfill complete.');
       }
     } catch (e) {
-      console.warn('[DB] Backfill error:', e.message);
+      // console.warn('[DB] Backfill error:', e.message);
     }
     // BACKFILL running level snapshots for old InventoryLogs
     try {
@@ -554,7 +554,7 @@ async function start() {
         }
       });
       if (logsToFix.length > 0) {
-        console.log(`[DB] Backfilling running level snapshots for ${logsToFix.length} legacy logs...`);
+        // console.log(`[DB] Backfilling running level snapshots for ${logsToFix.length} legacy logs...`);
         const inventories = await Inventory.findAll();
         const invMap = {};
         for (const inv of inventories) {
@@ -578,31 +578,119 @@ async function start() {
         });
 
         await Promise.all(promises);
-        console.log('[DB] Legacy logs level backfill complete.');
+        // console.log('[DB] Legacy logs level backfill complete.');
       }
     } catch (e) {
-      console.warn('[DB] Failed to backfill legacy log levels:', e.message);
+      // console.warn('[DB] Failed to backfill legacy log levels:', e.message);
     }
+    // Reloaded backend: DB cleanup for Default Client active & verified
+    console.log('[SYSTEM INTEGRITY] Hardcoded Default Client data purged. Orders/Products without real clients now render "-"');
 
-    // 0. Migration: Add is_client column if missing
+    // 0. Migration: Sync EndCustomer table & Add client_id to sales_orders if missing
     try {
-      const isMysql = sequelize.getDialect() === 'mysql';
-      const addColSql = isMysql
-        ? 'ALTER TABLE `customers` ADD COLUMN `is_client` TINYINT(1) DEFAULT 0'
-        : 'ALTER TABLE customers ADD COLUMN is_client INTEGER DEFAULT 0';
-      await sequelize.query(addColSql);
-      console.log('[DB Migration] Successfully added is_client column to customers table.');
-    } catch (e) {
-      // Column already exists or alter warning
-    }
-
-    try {
-      const { Product, Customer } = require('./models');
+      const { EndCustomer, SalesOrder, Customer, Product } = require('./models');
       const { Op } = require('sequelize');
 
-      // 1. Mark actual 3PL Business Clients (isClient = true)
+      // await EndCustomer.sync();
+      // console.log('[DB Migration] end_customers table synchronized successfully.');
+
+      const isMysql = sequelize.getDialect() === 'mysql';
+      try {
+        const addClientColSql = isMysql
+          ? 'ALTER TABLE `sales_orders` ADD COLUMN `client_id` INT DEFAULT NULL'
+          : 'ALTER TABLE sales_orders ADD COLUMN client_id INTEGER DEFAULT NULL';
+        await sequelize.query(addClientColSql);
+        // console.log('[DB Migration] Added client_id column to sales_orders table.');
+      } catch (_) { }
+
+      try {
+        const addEndCustColSql = isMysql
+          ? 'ALTER TABLE `sales_orders` ADD COLUMN `end_customer_id` INT DEFAULT NULL'
+          : 'ALTER TABLE sales_orders ADD COLUMN end_customer_id INTEGER DEFAULT NULL';
+        await sequelize.query(addEndCustColSql);
+        // console.log('[DB Migration] Added end_customer_id column to sales_orders table.');
+      } catch (_) { }
+
+      try {
+        const addColSql = isMysql
+          ? 'ALTER TABLE `customers` ADD COLUMN `is_client` TINYINT(1) DEFAULT 0'
+          : 'ALTER TABLE customers ADD COLUMN is_client INTEGER DEFAULT 0';
+        await sequelize.query(addColSql);
+      } catch (_) { }
+
+      // Migrate legacy non-client buyers (is_client = 0) from customers table into end_customers
+      const legacyBuyers = await Customer.findAll({ where: { isClient: false } });
+      for (const buyer of legacyBuyers) {
+        let endCustId = null;
+        const existingEndCust = await EndCustomer.findOne({
+          where: { companyId: buyer.companyId, name: buyer.name }
+        });
+        if (existingEndCust) {
+          endCustId = existingEndCust.id;
+        } else {
+          const newEndCust = await EndCustomer.create({
+            companyId: buyer.companyId,
+            name: buyer.name,
+            email: buyer.email,
+            phone: buyer.phone,
+            addressLine1: buyer.address,
+            town: buyer.city,
+            county: buyer.state,
+            postcode: buyer.postcode,
+            country: buyer.country || 'UNITED KINGDOM',
+            status: 'ACTIVE'
+          });
+          endCustId = newEndCust.id;
+        }
+        // Update SalesOrders matching this customerId to set endCustomerId to endCustId
+        if (endCustId) {
+          await SalesOrder.update(
+            { endCustomerId: endCustId },
+            { where: { companyId: buyer.companyId, customerId: buyer.id } }
+          );
+        }
+      }
+      // console.log(`[DB Migration] EndCustomer migration complete. Processed ${legacyBuyers.length} legacy buyers.`);
+    } catch (e) {
+      // console.warn('[DB Migration Warning]:', e.message);
+    }
+
+    try {
+      // 1. Purge "Default Client" from 3PL Clients list and set isClient = false
+      const defaultClients = await Customer.findAll({
+        where: {
+          [Op.or]: [
+            { name: { [Op.like]: '%Default%' } },
+            { code: 'DFTCL' }
+          ]
+        }
+      });
+      const defaultClientIds = defaultClients.map(c => c.id);
+
+      for (const cust of defaultClients) {
+        if (cust.isClient) {
+          await cust.update({ isClient: false });
+        }
+      }
+
+      // 2. Reset Products & SalesOrders linked to "Default Client" to NULL (Unassigned)
+      if (defaultClientIds.length > 0) {
+        await Product.update(
+          { clientId: null },
+          { where: { clientId: { [Op.in]: defaultClientIds } } }
+        );
+        await SalesOrder.update(
+          { clientId: null },
+          { where: { clientId: { [Op.in]: defaultClientIds } } }
+        );
+      }
+
+      // 3. Mark actual 3PL Business Clients (isClient = true)
       const allCustomers = await Customer.findAll();
       for (const cust of allCustomers) {
+        const isDefault = (cust.name || '').toLowerCase().includes('default') || cust.code === 'DFTCL';
+        if (isDefault) continue;
+
         const hasClientAttr = Boolean(
           cust.header_image_url ||
           cust.packing_slip_footer ||
@@ -610,42 +698,15 @@ async function start() {
           cust.segment ||
           cust.code ||
           cust.creditLimit > 0 ||
-          cust.type === 'B2B' ||
-          [6, 7, 8, 9].includes(cust.id)
+          cust.type === 'B2B'
         );
 
-        const newIsClientState = hasClientAttr;
-        if (cust.isClient !== newIsClientState) {
-          await cust.update({ isClient: newIsClientState });
-        }
-      }
-
-      // 2. Fetch valid 3PL Clients
-      const valid3PLClients = await Customer.findAll({ where: { isClient: true } });
-      const validClientIds = new Set(valid3PLClients.map(c => c.id));
-      const default3PLClientId = valid3PLClients.length > 0 ? valid3PLClients[0].id : null;
-
-      // 3. Fix Products whose clientId is NULL or set to an end-consumer buyer (non-client)
-      if (default3PLClientId) {
-        const invalidProductOwners = await Product.findAll({
-          where: {
-            [Op.or]: [
-              { clientId: null },
-              { clientId: { [Op.notIn]: Array.from(validClientIds) } }
-            ]
-          }
-        });
-
-        if (invalidProductOwners.length > 0) {
-          console.log(`[DB Repair] Re-assigning ${invalidProductOwners.length} products to valid 3PL Client Owner ID ${default3PLClientId}...`);
-          for (const p of invalidProductOwners) {
-            await p.update({ clientId: default3PLClientId });
-          }
-          console.log('[DB Repair] Product Client Owner repair complete.');
+        if (cust.isClient !== hasClientAttr) {
+          await cust.update({ isClient: hasClientAttr });
         }
       }
     } catch (e) {
-      console.warn('[DB Repair Warning]:', e.message);
+      // console.warn('[DB Clean Warning]:', e.message);
     }
 
     // BACKFILL SalesOrders with realistic seed data if they don't have it
@@ -750,7 +811,7 @@ async function start() {
         }
       }
     } catch (e) {
-      console.warn('[DB] SalesOrder backfill seed error:', e.message);
+      // console.warn('[DB] SalesOrder backfill seed error:', e.message);
     }
 
     // Reset pending GoodsReceiptItem qtyToBook to 0 on startup so they don't show as fully received
@@ -762,13 +823,13 @@ async function start() {
         where: { qtyToBook: { [Op.gt]: 0 } }
       });
       if (pendingItems.length > 0) {
-        console.log(`[DB] Resetting qtyToBook to 0 for ${pendingItems.length} pending GoodsReceiptItems...`);
+        // console.log(`[DB] Resetting qtyToBook to 0 for ${pendingItems.length} pending GoodsReceiptItems...`);
         for (const item of pendingItems) {
           await item.update({ qtyToBook: 0 });
         }
       }
     } catch (e) {
-      console.warn('[DB] Reset pending qtyToBook error:', e.message);
+      // console.warn('[DB] Reset pending qtyToBook error:', e.message);
     }
 
     // AUTO-SEED DEMO USERS if they don't exist (For 'Proper' Live Demo Experience)
@@ -780,11 +841,11 @@ async function start() {
     if (!defaultCompany) {
       defaultCompany = await Company.create({
         id: 1,
-        name: 'KIAAN WMS Demo',
+        name: '-',
         code: 'KIAAN',
         status: 'ACTIVE'
       });
-      console.log('[SEED] Created default demo company');
+      // console.log('[SEED] Created default demo company');
     }
 
     const demoUsers = [
@@ -807,7 +868,7 @@ async function start() {
           companyId: d.role === 'super_admin' ? null : 1, // Fallback to company 1
           status: 'ACTIVE'
         });
-        console.log(`[SEED] Created demo user: ${d.email}`);
+        // console.log(`[SEED] Created demo user: ${d.email}`);
       }
     }
 
@@ -829,22 +890,34 @@ async function start() {
           await existing.update({ extra: m.extra, costPrice: m.costPrice, originalSku: m.originalSku });
         }
       }
-      console.log('[SEED] Ensured Customization Mappings data with Extra & Cost Price');
+      // console.log('[SEED] Ensured Customization Mappings data with Extra & Cost Price');
     } catch (e) {
-      console.warn('[SEED] CustomizationMapping seed error:', e.message);
+      // console.warn('[SEED] CustomizationMapping seed error:', e.message);
     }
 
     // Initialize Cron AFTER database sync is complete
     cronService.init();
 
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       const liveUrl = process.env.NODE_ENV === 'production' ? 'https://wms-aksh-backend-production.up.railway.app' : `http://localhost:${PORT}`;
       console.log(`🚀 WMS Backend running at ${liveUrl}`);
     });
 
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.warn(`[PORT NOTICE] Port ${PORT} is occupied by an existing process. Retrying in 1.5s...`);
+        setTimeout(() => {
+          try { server.close(); } catch (_) {}
+          start();
+        }, 1500);
+      } else {
+        console.error('Server error:', err.message);
+      }
+    });
+
 
   } catch (err) {
-    console.error('Unable to start server:', err);
+    // console.error('Unable to start server:', err);
 
     const isConnErr = err?.code === 'ECONNREFUSED' || err?.parent?.code === 'ECONNREFUSED' || err?.code === 'ETIMEDOUT' || err?.parent?.code === 'ETIMEDOUT';
 

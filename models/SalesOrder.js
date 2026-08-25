@@ -6,6 +6,8 @@ const SalesOrder = sequelize.define('SalesOrder', {
   companyId: { type: DataTypes.INTEGER, allowNull: false },
   orderNumber: { type: DataTypes.STRING, allowNull: false },
   customerId: { type: DataTypes.INTEGER, allowNull: true },
+  clientId: { type: DataTypes.INTEGER, allowNull: true, field: 'client_id' },
+  endCustomerId: { type: DataTypes.INTEGER, allowNull: true, field: 'end_customer_id' },
   orderDate: { type: DataTypes.DATEONLY, allowNull: true },
   requiredDate: { type: DataTypes.DATEONLY, allowNull: true },
   priority: { type: DataTypes.STRING, defaultValue: 'MEDIUM' },

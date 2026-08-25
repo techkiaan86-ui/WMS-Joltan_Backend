@@ -33,6 +33,7 @@ router.post('/despatch-templates', requireRole('super_admin', 'company_admin'), 
 router.put('/despatch-templates/:id', requireRole('super_admin', 'company_admin'), despatchNoteTemplateController.update);
 router.delete('/despatch-templates/:id', requireRole('super_admin', 'company_admin'), despatchNoteTemplateController.remove);
 
+router.get('/end-customers', requireRole('super_admin', 'company_admin', 'inventory_manager', 'picker', 'packer', 'viewer'), customerController.listEndCustomers);
 router.get('/customers', requireRole('super_admin', 'company_admin', 'inventory_manager', 'picker', 'packer', 'viewer'), customerController.list);
 router.get('/customers/:id', requireRole('super_admin', 'company_admin', 'inventory_manager', 'picker', 'packer', 'viewer'), customerController.getById);
 router.post('/customers', requireRole('super_admin', 'company_admin'), customerController.create);

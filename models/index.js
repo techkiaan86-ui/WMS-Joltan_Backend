@@ -41,6 +41,7 @@ const DespatchNoteTemplate = require('./DespatchNoteTemplate');
 const IntegrationConfig = require('./IntegrationConfig');
 const IntegrationLog = require('./IntegrationLog');
 const CustomizationMapping = require('./CustomizationMapping');
+const EndCustomer = require('./EndCustomer');
 
 
 
@@ -128,9 +129,19 @@ Warehouse.hasMany(Zone, { foreignKey: 'warehouseId', onDelete: 'CASCADE', hooks:
 Zone.hasMany(Location, { foreignKey: 'zoneId', onDelete: 'CASCADE', hooks: true });
 Location.belongsTo(Zone, { foreignKey: 'zoneId' });
 
-// SalesOrder -> OrderItem, PickList, PackingTask, Shipment, Customer
-Customer.hasMany(SalesOrder, { foreignKey: 'customerId', as: 'SalesOrders' });
-SalesOrder.belongsTo(Customer, { foreignKey: 'customerId', as: 'Client' });
+// Company -> EndCustomer
+Company.hasMany(EndCustomer, { foreignKey: 'companyId' });
+EndCustomer.belongsTo(Company, { foreignKey: 'companyId' });
+Customer.hasMany(EndCustomer, { foreignKey: 'clientId', as: 'EndCustomers' });
+EndCustomer.belongsTo(Customer, { foreignKey: 'clientId', as: 'Client' });
+
+// SalesOrder -> OrderItem, PickList, PackingTask, Shipment, Customer (Legacy/Direct), EndCustomer & Client (3PL Client)
+Customer.hasMany(SalesOrder, { foreignKey: 'clientId', as: 'ClientSalesOrders' });
+SalesOrder.belongsTo(Customer, { foreignKey: 'clientId', as: 'Client' });
+Customer.hasMany(SalesOrder, { foreignKey: 'customerId', as: 'CustomerSalesOrders' });
+SalesOrder.belongsTo(Customer, { foreignKey: 'customerId', as: 'Customer' });
+EndCustomer.hasMany(SalesOrder, { foreignKey: 'endCustomerId', as: 'SalesOrders' });
+SalesOrder.belongsTo(EndCustomer, { foreignKey: 'endCustomerId', as: 'EndCustomer' });
 SalesOrder.hasMany(OrderItem, { foreignKey: 'salesOrderId', as: 'OrderItems', onDelete: 'CASCADE', hooks: true });
 OrderItem.belongsTo(SalesOrder, { foreignKey: 'salesOrderId', as: 'SalesOrder' });
 OrderItem.belongsTo(Product, { foreignKey: 'productId' });
@@ -334,4 +345,5 @@ module.exports = {
   IntegrationConfig,
   IntegrationLog,
   CustomizationMapping,
+  EndCustomer,
 };
