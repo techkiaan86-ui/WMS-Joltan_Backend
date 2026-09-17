@@ -40,19 +40,31 @@ async function getStoreMappings(req, res, next) {
     });
     const creds = config && config.credentials ? (typeof config.credentials === 'string' ? JSON.parse(config.credentials) : config.credentials) : {};
     
-    // Fetch live connected stores from ShipStation API if available
-    let liveStores = [];
-    try {
-      liveStores = await shipstationService.getShipStationStores(companyId);
-    } catch (e) {
-      // Ignore
+    // Instant response from local database (< 5ms)
+    let stores = creds.cachedStores || creds.stores || [];
+
+    // Only fetch remote stores if explicitly requested via ?refreshStores=true
+    if (req.query.refreshStores === 'true') {
+      try {
+        const liveStores = await shipstationService.getShipStationStores(companyId);
+        if (Array.isArray(liveStores) && liveStores.length > 0) {
+          stores = liveStores;
+          creds.cachedStores = liveStores;
+          await config.update({ credentials: JSON.stringify(creds) });
+        }
+      } catch (e) {
+        // Ignore remote store fetch errors
+      }
     }
 
     res.json({
       success: true,
       apiKey: creds.apiKey || process.env.SHIPSTATION_API_KEY || '',
+      orderSyncDays: Number(creds.orderSyncDays) || 30,
+      startDate: creds.startDate || null,
+      endDate: creds.endDate || null,
       storeMappings: creds.storeMappings || {},
-      stores: liveStores
+      stores
     });
   } catch (err) {
     next(err);
@@ -62,7 +74,7 @@ async function getStoreMappings(req, res, next) {
 async function saveStoreMappings(req, res, next) {
   try {
     const companyId = req.user.companyId || 1;
-    const { storeMappings, apiKey, apiSecret } = req.body;
+    const { storeMappings, apiKey, apiSecret, orderSyncDays, startDate, endDate, autoSync } = req.body;
 
     let config = await IntegrationConfig.findOne({
       where: { companyId, platform: 'SHIPSTATION' }
@@ -72,7 +84,11 @@ async function saveStoreMappings(req, res, next) {
     const newCreds = {
       apiKey: apiKey && apiKey !== '********' ? apiKey : (oldCreds.apiKey || process.env.SHIPSTATION_API_KEY || ''),
       apiSecret: apiSecret && apiSecret !== '********' ? apiSecret : (oldCreds.apiSecret || process.env.SHIPSTATION_API_SECRET || ''),
-      storeMappings: storeMappings || oldCreds.storeMappings || {}
+      orderSyncDays: orderSyncDays ? Math.max(1, Number(orderSyncDays) || 30) : (oldCreds.orderSyncDays || 30),
+      startDate: startDate || oldCreds.startDate || null,
+      endDate: endDate || oldCreds.endDate || null,
+      storeMappings: storeMappings || oldCreds.storeMappings || {},
+      cachedStores: oldCreds.cachedStores || oldCreds.stores || []
     };
 
     const payload = {
@@ -88,23 +104,32 @@ async function saveStoreMappings(req, res, next) {
       await IntegrationConfig.create(payload);
     }
 
-    // Auto-trigger Order Sync immediately upon connecting/saving
-    let syncResult = null;
-    try {
-      syncResult = await shipstationService.syncOrdersFromShipStation(companyId);
-    } catch (err) {
-      console.error('[ShipStation Auto-Sync Error on Connect]:', err.message);
+    // Only run order sync if explicitly requested (e.g. Save & Sync Now)
+    let syncedCount = 0;
+    if (autoSync === true) {
+      try {
+        const syncResult = await shipstationService.syncOrdersFromShipStation(companyId, {
+          daysPast: newCreds.orderSyncDays,
+          startDate: newCreds.startDate,
+          endDate: newCreds.endDate
+        });
+        syncedCount = syncResult?.syncedCount || 0;
+      } catch (err) {
+        console.error('[ShipStation Sync Error on Save]:', err.message);
+      }
     }
 
-    const syncedCount = syncResult?.syncedCount || 0;
-    const msg = syncResult?.success
-      ? `✅ ShipStation connected successfully! ${syncedCount} orders automatically synced into WMS.`
-      : 'ShipStation settings saved. Please check credentials if sync fails.';
+    const msg = autoSync
+      ? `✅ Settings saved & ${syncedCount} orders synced into WMS.`
+      : '✅ ShipStation sync settings saved successfully.';
 
     res.json({
       success: true,
       message: msg,
       storeMappings: newCreds.storeMappings,
+      orderSyncDays: newCreds.orderSyncDays,
+      startDate: newCreds.startDate,
+      endDate: newCreds.endDate,
       syncedCount
     });
   } catch (err) {

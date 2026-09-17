@@ -4,7 +4,7 @@ const { sequelize } = require('../config/db');
 const OrderItem = sequelize.define('OrderItem', {
   id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
   salesOrderId: { type: DataTypes.INTEGER, allowNull: false },
-  productId: { type: DataTypes.INTEGER, allowNull: false },
+  productId: { type: DataTypes.INTEGER, allowNull: true },
   quantity: { type: DataTypes.INTEGER, allowNull: false },
   unitPrice: { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
   netPrice: { type: DataTypes.DECIMAL(12, 2), allowNull: true, defaultValue: 0 },
@@ -21,6 +21,7 @@ const OrderItem = sequelize.define('OrderItem', {
   isBundleParent: { type: DataTypes.BOOLEAN, defaultValue: false, field: 'is_bundle_parent' },
   bundleHeader: { type: DataTypes.STRING, allowNull: true, field: 'bundle_header' },
   productImageUrl: { type: DataTypes.TEXT, allowNull: true, field: 'product_image_url' },
+  name: { type: DataTypes.TEXT, allowNull: true, field: 'name' },
   
   // Amazon Customization fields
   originalSku: { type: DataTypes.STRING, allowNull: true, field: 'original_sku' },

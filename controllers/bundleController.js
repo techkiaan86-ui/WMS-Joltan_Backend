@@ -57,5 +57,15 @@ async function bulkUpload(req, res, next) {
   }
 }
 
-module.exports = { list, getById, create, update, remove, bulkUpload };
+async function convertFromProduct(req, res, next) {
+  try {
+    const data = await bundleService.convertFromProduct(req.params.productId, req.body, req.user);
+    res.json({ success: true, message: 'Product successfully converted to Bundle!', data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { list, getById, create, update, remove, bulkUpload, convertFromProduct };
+
 

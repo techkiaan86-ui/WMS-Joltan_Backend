@@ -94,6 +94,9 @@ async function bulkActionProducts(req, res, next) {
     const data = await inventoryService.bulkActionProducts(action, productIds, req.user);
     res.json({ success: true, ...data });
   } catch (err) {
+    if (err.message && err.message.includes('in use')) {
+      return res.status(400).json({ success: false, inUse: true, message: 'This product is in use and cannot be deleted.' });
+    }
     next(err);
   }
 }
@@ -127,6 +130,9 @@ async function removeProduct(req, res, next) {
     res.json({ success: true, ...result });
   } catch (err) {
     if (err.message === 'Product not found') return res.status(404).json({ success: false, message: err.message });
+    if (err.message && err.message.includes('in use')) {
+      return res.status(400).json({ success: false, inUse: true, message: 'This product is in use and cannot be deleted.' });
+    }
     res.status(400).json({ success: false, message: err.message });
   }
 }

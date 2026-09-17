@@ -247,7 +247,7 @@ router.post('/disconnect', authenticate, requireRole(...adminRoles), async (req,
 router.post('/sync', authenticate, requireRole(...adminRoles), async (req, res, next) => {
   try {
     const companyId = req.user.companyId;
-    const { platform, startDate, endDate } = req.body;
+    const { platform, startDate, endDate, daysPast, orderSyncDays } = req.body;
     let recordsCount = 0;
 
     if (!platform) {
@@ -279,12 +279,13 @@ router.post('/sync', authenticate, requireRole(...adminRoles), async (req, res, 
         console.error('[Sync Timestamp Update Error]:', tErr.message);
       }
 
-      // Launch full 12-domain master sync asynchronously in background
-      shipstationService.syncAllFromShipStation(compId, { startDate, endDate })
+      // Launch full 12-domain master sync asynchronously in background with configured date window
+      shipstationService.syncAllFromShipStation(compId, { startDate, endDate, daysPast, orderSyncDays })
         .then(syncRes => console.log(`[ShipStation Master Sync Complete]: ${syncRes?.message}`))
         .catch(err => console.error('[ShipStation Master Sync Error]:', err.message));
 
-      const dateInfo = (startDate || endDate) ? ` (${startDate || 'Start'} to ${endDate || 'Today'})` : '';
+      const syncDaysText = (daysPast || orderSyncDays) ? ` (Past ${daysPast || orderSyncDays} days)` : '';
+      const dateInfo = (startDate || endDate) ? ` (${startDate || 'Start'} to ${endDate || 'Today'})` : syncDaysText;
       return res.json({
         success: true,
         message: `⚡ ShipStation Live Sync started${dateInfo}! Orders, Products, Warehouses & Inventory are updating in background.`

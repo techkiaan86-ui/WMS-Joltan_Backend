@@ -11,5 +11,7 @@ router.put('/:id', authenticate, customDataController.update);
 router.delete('/:id', authenticate, customDataController.remove);
 router.post('/upload-csv', authenticate, upload.single('file'), customDataController.uploadCsv);
 router.get('/export-csv', authenticate, customDataController.exportCsv);
+router.post('/process-orders', authenticate, customDataController.processAllOrders);
 
 module.exports = router;
+

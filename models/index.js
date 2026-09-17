@@ -42,6 +42,7 @@ const IntegrationConfig = require('./IntegrationConfig');
 const IntegrationLog = require('./IntegrationLog');
 const CustomizationMapping = require('./CustomizationMapping');
 const EndCustomer = require('./EndCustomer');
+const ProductPool = require('./ProductPool');
 
 
 
@@ -301,6 +302,15 @@ Return.belongsTo(Shipment, { foreignKey: 'shipmentId' });
 Customer.hasMany(Return, { foreignKey: 'customerId' });
 Return.belongsTo(Customer, { foreignKey: 'customerId' });
 
+// ProductPool associations
+Company.hasMany(ProductPool, { foreignKey: 'companyId' });
+ProductPool.belongsTo(Company, { foreignKey: 'companyId' });
+ProductPool.belongsTo(Product, { foreignKey: 'resolvedProductId', as: 'ResolvedProduct' });
+ProductPool.belongsTo(Bundle, { foreignKey: 'resolvedBundleId', as: 'ResolvedBundle' });
+
+// Ensure ProductPool table exists
+ProductPool.sync().catch(err => console.warn('[ProductPool Sync Notice]:', err.message));
+
 module.exports = {
   sequelize,
   User,
@@ -346,4 +356,5 @@ module.exports = {
   IntegrationLog,
   CustomizationMapping,
   EndCustomer,
+  ProductPool,
 };

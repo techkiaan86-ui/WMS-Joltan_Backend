@@ -1,4 +1,4 @@
-const { Bundle, BundleItem, Product } = require('../models');
+const { Bundle, BundleItem, Product, ProductStock } = require('../models');
 const { Op } = require('sequelize');
 
 async function list(reqUser, query = {}) {
@@ -16,20 +16,44 @@ async function list(reqUser, query = {}) {
     order: [['createdAt', 'DESC']],
     include: [{
       association: 'BundleItems',
-      include: [{ association: 'Product', attributes: ['id', 'name', 'sku'] }],
+      include: [{
+        association: 'Product',
+        attributes: ['id', 'name', 'sku', 'costPrice', 'price'],
+        include: [{
+          association: 'ProductStocks',
+          attributes: ['quantity', 'reserved']
+        }]
+      }],
     }],
   });
   return bundles.map(b => {
     const j = b.toJSON();
-    if (j.BundleItems) {
-      j.bundleItems = j.BundleItems.map(it => ({
-        id: it.id,
-        productId: it.productId,
-        quantity: it.quantity,
-        child: it.Product,
-      }));
+    let minBuildable = Infinity;
+    if (j.BundleItems && j.BundleItems.length > 0) {
+      j.bundleItems = j.BundleItems.map(it => {
+        const prod = it.Product;
+        const totalStock = (prod?.ProductStocks || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+        const reqQty = Number(it.quantity) || 1;
+        const buildable = Math.floor(totalStock / reqQty);
+        if (buildable < minBuildable) {
+          minBuildable = buildable;
+        }
+        return {
+          id: it.id,
+          productId: it.productId,
+          quantity: it.quantity,
+          child: it.Product,
+          componentStock: totalStock,
+          buildableQuantity: buildable
+        };
+      });
       delete j.BundleItems;
+    } else {
+      minBuildable = 0;
+      j.bundleItems = [];
     }
+    j.quantity = minBuildable === Infinity ? 0 : minBuildable;
+    j.availableStock = j.quantity;
     return j;
   });
 }
@@ -38,16 +62,45 @@ async function getById(id, reqUser) {
   const bundle = await Bundle.findByPk(id, {
     include: [{
       association: 'BundleItems',
-      include: [{ association: 'Product', attributes: ['id', 'name', 'sku'] }],
+      include: [{
+        association: 'Product',
+        attributes: ['id', 'name', 'sku', 'costPrice', 'price'],
+        include: [{
+          association: 'ProductStocks',
+          attributes: ['quantity', 'reserved']
+        }]
+      }],
     }],
   });
   if (!bundle) throw new Error('Bundle not found');
   if (reqUser.role !== 'super_admin' && bundle.companyId !== reqUser.companyId) throw new Error('Bundle not found');
   const j = bundle.toJSON();
-  if (j.BundleItems) {
-    j.bundleItems = j.BundleItems.map(it => ({ id: it.id, productId: it.productId, quantity: it.quantity, child: it.Product }));
+  let minBuildable = Infinity;
+  if (j.BundleItems && j.BundleItems.length > 0) {
+    j.bundleItems = j.BundleItems.map(it => {
+      const prod = it.Product;
+      const totalStock = (prod?.ProductStocks || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+      const reqQty = Number(it.quantity) || 1;
+      const buildable = Math.floor(totalStock / reqQty);
+      if (buildable < minBuildable) {
+        minBuildable = buildable;
+      }
+      return {
+        id: it.id,
+        productId: it.productId,
+        quantity: it.quantity,
+        child: it.Product,
+        componentStock: totalStock,
+        buildableQuantity: buildable
+      };
+    });
     delete j.BundleItems;
+  } else {
+    minBuildable = 0;
+    j.bundleItems = [];
   }
+  j.quantity = minBuildable === Infinity ? 0 : minBuildable;
+  j.availableStock = j.quantity;
   return j;
 }
 
@@ -225,5 +278,102 @@ async function bulkUpload(data, reqUser) {
   return results;
 }
 
-module.exports = { list, getById, create, update, remove, bulkUpload };
+async function convertFromProduct(productId, data, reqUser) {
+  const companyId = reqUser.companyId || data.companyId || 1;
+  const product = await Product.findByPk(productId);
+  if (!product) throw new Error('Product not found');
+  if (reqUser.role !== 'super_admin' && product.companyId !== companyId) throw new Error('Product not found');
+
+  // CASE 1: Linking this product as a component recipe child of an existing bundle (Like Product Pool match-bundle)
+  if (data.bundleId) {
+    const targetBundle = await Bundle.findByPk(data.bundleId);
+    if (!targetBundle) throw new Error('Selected target bundle not found');
+    if (reqUser.role !== 'super_admin' && targetBundle.companyId !== companyId) throw new Error('Bundle not found');
+
+    const compQty = parseInt(data.quantity || data.componentQuantity || 1, 10) || 1;
+    const existingBundleItem = await BundleItem.findOne({
+      where: {
+        bundleId: targetBundle.id,
+        productId: product.id
+      }
+    });
+
+    if (existingBundleItem) {
+      await existingBundleItem.update({ quantity: compQty });
+    } else {
+      await BundleItem.create({
+        bundleId: targetBundle.id,
+        productId: product.id,
+        quantity: compQty
+      });
+    }
+
+    // Recalculate bundle cost price from all its components
+    const allBundleItems = await BundleItem.findAll({
+      where: { bundleId: targetBundle.id },
+      include: [{ association: 'Product' }]
+    });
+    let calculatedBundleCost = 0;
+    for (const bi of allBundleItems) {
+      const pCost = bi.Product?.costPrice != null ? Number(bi.Product.costPrice) : (Number(bi.Product?.price || 0) * 0.6);
+      calculatedBundleCost += pCost * (bi.quantity || 1);
+    }
+    if (calculatedBundleCost > 0) {
+      await targetBundle.update({ costPrice: Number(calculatedBundleCost.toFixed(2)) });
+    }
+
+    return getById(targetBundle.id, reqUser);
+  }
+
+  // CASE 2: Creating or updating a bundle with this SKU/Name
+  const bundleSku = (data.sku || product.sku).trim();
+  const bundleName = (data.name || data.bundleName || product.name).trim();
+
+  // Find or create Bundle record
+  let bundle = await Bundle.findOne({ where: { companyId: product.companyId, sku: bundleSku } });
+  if (!bundle) {
+    bundle = await Bundle.create({
+      companyId: product.companyId,
+      sku: bundleSku,
+      name: bundleName,
+      description: data.description || product.description || `Converted from Product ${product.sku}`,
+      costPrice: data.costPrice != null ? data.costPrice : (product.costPrice || 0),
+      sellingPrice: data.sellingPrice != null ? data.sellingPrice : (product.price || 0),
+      status: 'ACTIVE'
+    });
+  } else {
+    await bundle.update({
+      name: bundleName,
+      description: data.description || bundle.description,
+      costPrice: data.costPrice != null ? data.costPrice : bundle.costPrice,
+      sellingPrice: data.sellingPrice != null ? data.sellingPrice : bundle.sellingPrice,
+      status: 'ACTIVE'
+    });
+  }
+
+  // Attach components/items if provided (support both bundleItems and items)
+  const incomingItems = Array.isArray(data.bundleItems) ? data.bundleItems : (Array.isArray(data.items) ? data.items : null);
+  if (incomingItems && incomingItems.length > 0) {
+    await BundleItem.destroy({ where: { bundleId: bundle.id } });
+    let calculatedCost = 0;
+    for (const it of incomingItems.filter(i => i.productId && i.quantity > 0)) {
+      await BundleItem.create({ bundleId: bundle.id, productId: it.productId, quantity: it.quantity });
+      const compProduct = await Product.findByPk(it.productId);
+      if (compProduct) {
+        const compCost = compProduct.costPrice != null ? Number(compProduct.costPrice) : (Number(compProduct.price || 0) * 0.6);
+        calculatedCost += compCost * Number(it.quantity);
+      }
+    }
+    if (calculatedCost > 0) {
+      await bundle.update({ costPrice: Number(calculatedCost.toFixed(2)) });
+    }
+  }
+
+  // Mark Product as BUNDLE
+  await product.update({ productType: 'BUNDLE' });
+
+  return getById(bundle.id, reqUser);
+}
+
+module.exports = { list, getById, create, update, remove, bulkUpload, convertFromProduct };
 

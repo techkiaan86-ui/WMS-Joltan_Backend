@@ -18,16 +18,18 @@ function init() {
         await processScheduledReports();
     });
 
-    // High-frequency live order sync loop (runs every 30 seconds)
+    // Automatic background order sync disabled as requested by user & Zoltan
+    // Sync will now ONLY run manually when triggered by the user from the UI/API.
+    /*
     setInterval(async () => {
         await runAllIntegrationsSync();
     }, 30000);
 
-    // Run initial sync 1 second after server start
     setTimeout(() => {
         console.log('[CRON] Executing initial live order sync on startup...');
         runAllIntegrationsSync().catch(e => console.error('[CRON Startup Sync Error]:', e.message));
     }, 1000);
+    */
 }
 
 async function processScheduledReports() {

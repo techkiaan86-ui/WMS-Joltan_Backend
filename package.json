@@ -8,6 +8,7 @@
     "dev": "nodemon server.js || node server.js",
     "seed": "node scripts/seed.js",
     "db:reset": "node scripts/seed.js --reset",
+    "db:clean": "node cleanup_db.js",
     "create-superadmin": "node scripts/create-superadmin.js",
     "test:bulk-supplier-products": "node scripts/test-supplier-product-bulk-upload.js"
   },

@@ -193,7 +193,9 @@ async function list(reqUser, query = {}) {
         { '$Client.city$': { [Op.like]: searchVal } },
         { '$Client.postcode$': { [Op.like]: searchVal } },
         { '$OrderItems.Product.sku$': { [Op.like]: searchVal } },
-        { '$OrderItems.Product.name$': { [Op.like]: searchVal } }
+        { '$OrderItems.Product.name$': { [Op.like]: searchVal } },
+        { '$OrderItems.original_sku$': { [Op.like]: searchVal } },
+        { '$OrderItems.name$': { [Op.like]: searchVal } }
       ]
     });
   }
@@ -291,8 +293,31 @@ async function list(reqUser, query = {}) {
   const rowsMap = new Map(rows.map(r => [r.id, r]));
   const orderedRows = ids.map(id => rowsMap.get(id)).filter(Boolean);
 
+  const plainItems = orderedRows.map((o) => {
+    const json = o.get({ plain: true });
+    if (Array.isArray(json.OrderItems)) {
+      json.OrderItems = json.OrderItems.map(item => {
+        const rawSku = (item.originalSku || item.original_sku || '').trim();
+        const prodSku = (item.Product?.sku || '').trim();
+        const itemTitle = (item.name || '').trim();
+        const prodName = (item.Product?.name || '').trim();
+
+        // If product is missing or is dummy UNMATCHED-POOL placeholder, supply the original SKU & name
+        if (!item.Product || prodSku === 'UNMATCHED-POOL') {
+          item.Product = {
+            ...(item.Product || {}),
+            sku: (rawSku && rawSku !== 'UNMATCHED-POOL') ? rawSku : (prodSku || rawSku || '—'),
+            name: (itemTitle && itemTitle !== 'Unmatched Products Pool') ? itemTitle : (prodName || itemTitle || '—')
+          };
+        }
+        return item;
+      });
+    }
+    return json;
+  });
+
   return {
-    items: orderedRows.map((o) => o.get({ plain: true })),
+    items: plainItems,
     total: totalCount,
     page,
     pageSize: limit
@@ -321,6 +346,19 @@ async function getById(id, reqUser) {
     const orderTotal = Number(orderJson.totalAmount) || 0;
 
     orderJson.OrderItems = orderJson.OrderItems.map(item => {
+      const rawSku = (item.originalSku || item.original_sku || '').trim();
+      const prodSku = (item.Product?.sku || '').trim();
+      const itemTitle = (item.name || '').trim();
+      const prodName = (item.Product?.name || '').trim();
+
+      if (!item.Product || prodSku === 'UNMATCHED-POOL') {
+        item.Product = {
+          ...(item.Product || {}),
+          sku: (rawSku && rawSku !== 'UNMATCHED-POOL') ? rawSku : (prodSku || rawSku || '—'),
+          name: (itemTitle && itemTitle !== 'Unmatched Products Pool') ? itemTitle : (prodName || itemTitle || '—')
+        };
+      }
+
       let img = item.productImageUrl || item.product_image_url || item.imageUrl || item.image_url;
       if (!img && item.Product) {
         const pImgs = item.Product.images || item.Product.imageUrl || item.Product.image;

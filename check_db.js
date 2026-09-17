@@ -1,37 +1,31 @@
 require('dotenv').config();
-const { sequelize, InventoryLog, Inventory } = require('./models');
+const { sequelize, SalesOrder, OrderItem, Product, ProductPool } = require('./models');
 
 async function check() {
   try {
     await sequelize.authenticate();
-    console.log('Connected successfully to database.');
+    console.log('[DB] Connected successfully to database.');
 
-    // Print count of all logs
-    const totalLogs = await InventoryLog.count();
-    console.log('Total inventory logs:', totalLogs);
+    const soCount = await SalesOrder.count();
+    const oiCount = await OrderItem.count();
+    const prodCount = await Product.count();
+    const poolCount = await ProductPool.count();
 
-    // Print logs with null levels
-    const nullLogs = await InventoryLog.count({
-      where: {
-        newStockLevel: null
-      }
-    });
-    console.log('Logs with NULL stock level:', nullLogs);
+    console.log('--- WMS Current Status ---');
+    console.log('Total Sales Orders:', soCount);
+    console.log('Total Order Items:', oiCount);
+    console.log('Total Products in Catalog:', prodCount);
+    console.log('Total Items in Product Pool:', poolCount);
 
-    // Print first 5 logs
-    const logs = await InventoryLog.findAll({
-      limit: 5,
-      order: [['id', 'DESC']]
-    });
-
-    console.log('Last 5 log entries:');
-    for (const log of logs) {
-      console.log(`ID: ${log.id}, SKU: ${log.productId}, Type: ${log.type}, Qty: ${log.quantity}, Stock: ${log.newStockLevel}, Allocated: ${log.newAllocatedLevel}, OnHand: ${log.newOnHandLevel}`);
+    const poolItems = await ProductPool.findAll({ limit: 10, order: [['id', 'DESC']] });
+    console.log('\nLast Product Pool Items:');
+    for (const p of poolItems) {
+      console.log(`- SKU: ${p.sku}, Name: ${p.name}, Status: ${p.status}, Order: ${p.orderNumber}`);
     }
 
     process.exit(0);
   } catch (err) {
-    console.error('Error during database check:', err);
+    console.error('Error during database check:', err.message);
     process.exit(1);
   }
 }

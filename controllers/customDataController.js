@@ -110,23 +110,23 @@ async function uploadCsv(req, res, next) {
       .pipe(csvParser())
       .on('data', (row) => {
         // Headers matching data.csv: sku, ASIN, optionValue, SKU (processedSku), OUT of Stock, Extra, cost price
-        const originalSku = row.sku || row.OriginalSku || row.originalSku || '';
-        const asin = row.ASIN || row.asin || '';
-        const optionValue = row.optionValue || row.OptionValue || '';
-        const processedSku = row.SKU || row.processedSku || row.ProcessedSku || '';
-        const outOfStockStr = String(row['OUT of Stock'] || row.outOfStock || '').trim().toUpperCase();
-        const extra = row.Extra || row.extra || '';
-        const costPriceStr = row['cost price'] || row.costPrice || '';
+        const originalSku = (row.sku || row.OriginalSku || row.originalSku || row.original_sku || row.PARENT_SKU || '').trim();
+        const asin = (row.ASIN || row.asin || row.Asin || '').trim();
+        const optionValue = (row.optionValue || row.OptionValue || row.option_value || row['Option Value'] || '').trim();
+        const processedSku = (row.SKU || row.processedSku || row.ProcessedSku || row.processed_sku || row['Processed SKU'] || '').trim();
+        const outOfStockStr = String(row['OUT of Stock'] || row.outOfStock || row['out_of_stock'] || '').trim().toUpperCase();
+        const extra = (row.Extra || row.extra || '').trim();
+        const costPriceStr = row['cost price'] || row.costPrice || row['cost_price'] || '';
 
-        if (asin && optionValue && processedSku) {
+        if (processedSku && (asin || originalSku)) {
           results.push({
             companyId,
-            originalSku: originalSku.trim() || null,
-            asin: asin.trim(),
-            optionValue: optionValue.trim(),
-            processedSku: processedSku.trim(),
-            outOfStock: outOfStockStr === 'TRUE' || outOfStockStr === '1',
-            extra: extra.trim() || null,
+            originalSku: originalSku || null,
+            asin: asin || null,
+            optionValue: optionValue || '',
+            processedSku: processedSku,
+            outOfStock: outOfStockStr === 'TRUE' || outOfStockStr === '1' || outOfStockStr === 'YES',
+            extra: extra || null,
             costPrice: costPriceStr ? parseFloat(costPriceStr) : null
           });
         }
@@ -137,7 +137,26 @@ async function uploadCsv(req, res, next) {
           await CustomizationMapping.upsert(record);
           inserted++;
         }
-        res.json({ success: true, message: `Successfully processed ${inserted} mapping records.` });
+
+        // Auto-run customization extraction on all pending orders with new CSV mappings
+        let orderResult = { totalUpdated: 0, scannedOrders: 0 };
+        try {
+          const amazonCustomService = require('../services/amazonCustomService');
+          orderResult = await amazonCustomService.processAllPendingOrders(companyId);
+        } catch (procErr) {
+          console.error('[uploadCsv] Auto extraction error:', procErr.message);
+        }
+
+        const msg = orderResult.totalUpdated > 0
+          ? `Successfully processed ${inserted} mappings. Automatically extracted & updated ${orderResult.totalUpdated} order item(s) to actual SKUs!`
+          : `Successfully processed ${inserted} mapping records.`;
+
+        res.json({ 
+          success: true, 
+          message: msg,
+          updatedOrders: orderResult.totalUpdated,
+          scannedOrders: orderResult.scannedOrders
+        });
       });
   } catch (err) {
     next(err);
@@ -175,11 +194,34 @@ async function exportCsv(req, res, next) {
   }
 }
 
+async function processAllOrders(req, res, next) {
+  try {
+    const companyId = req.user?.companyId || 1;
+    const amazonCustomService = require('../services/amazonCustomService');
+    const result = await amazonCustomService.processAllPendingOrders(companyId);
+    res.json({
+      success: true,
+      message: result.totalUpdated > 0
+        ? `Extraction complete! Updated ${result.totalUpdated} order item(s) to actual SKUs.`
+        : `Extraction complete: All candidate orders are already up to date.`,
+      data: result
+    });
+  } catch (err) {
+    console.error('[processAllOrders Error]:', err);
+    res.status(500).json({
+      success: false,
+      message: `Extraction failed: ${err.message}`
+    });
+  }
+}
+
 module.exports = {
   list,
   create,
   update,
   remove,
   uploadCsv,
-  exportCsv
+  exportCsv,
+  processAllOrders
 };
+

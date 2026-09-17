@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { SalesOrder, OrderItem, Product, ProductStock, IntegrationConfig, Customer, Warehouse, Zone, Location, Category, Inventory, Shipment } = require('../../models');
+const { SalesOrder, OrderItem, Product, ProductStock, IntegrationConfig, Customer, Warehouse, Zone, Location, Category, Inventory, Shipment, Bundle, ProductPool } = require('../../models');
 
 const SHIPSTATION_V2_BASE_URL = process.env.SHIPSTATION_API_URL || 'https://api.shipstation.com/v2';
 
@@ -12,6 +12,7 @@ async function getShipStationConfig(companyId) {
   let apiKey = envKey;
   let apiSecret = envSecret;
   let storeMappings = {};
+  let orderSyncDays = 30;
 
   if (companyId) {
     const { Op } = require('sequelize');
@@ -32,6 +33,7 @@ async function getShipStationConfig(companyId) {
           apiSecret = creds.apiSecret.trim();
         }
         if (creds.storeMappings) storeMappings = creds.storeMappings;
+        if (creds.orderSyncDays) orderSyncDays = Math.max(1, Number(creds.orderSyncDays) || 30);
       }
     } catch (err) {
       console.error('[getShipStationConfig Warning]:', err.message);
@@ -45,7 +47,7 @@ async function getShipStationConfig(companyId) {
     apiSecret = envSecret;
   }
 
-  return { apiKey, apiSecret, baseUrl: process.env.SHIPSTATION_API_URL || SHIPSTATION_V2_BASE_URL, storeMappings };
+  return { apiKey, apiSecret, baseUrl: process.env.SHIPSTATION_API_URL || SHIPSTATION_V2_BASE_URL, storeMappings, orderSyncDays };
 }
 
 function firstProductImage(images) {
@@ -308,65 +310,67 @@ async function getOrCreateProductFromChannelItem(item, companyId, productImageUr
 
   let product = await Product.findOne({ where: { sku, companyId: companyId || 1 } });
 
+  // 1. If not found by primary SKU, check Alternative SKUs on existing products
   if (!product) {
-    const imagesList = productImageUrl ? [productImageUrl] : null;
-    const rawCategory = item ? (item.category || item.category_name || item.categoryName) : null;
-    const category = await getOrCreateCategory(companyId || 1, rawCategory);
-
+    const { Op } = require('sequelize');
     try {
-      product = await Product.create({
-        companyId: companyId || 1,
-        categoryId: category ? category.id : null,
-        clientId: effectiveClientId,
-        name,
-        sku,
-        barcode,
-        price,
-        costPrice,
-        description: `${name} - Imported ShipStation Product`,
-        productType: 'SINGLE',
-        unitOfMeasure: 'Units',
-        vatRate: 20.00,
-        vatCode: 'STANDARD',
-        customsTariff: '1905.90.80',
-        weight: 200.00,
-        weightUnit: 'g',
-        length: 15.00,
-        width: 10.00,
-        height: 5.00,
-        dimensionUnit: 'cm',
-        reorderLevel: 10,
-        reorderQty: 50,
-        maxStock: 1000,
-        heatSensitive: 'NO',
-        perishable: 'NO',
-        requireBatchTracking: 'NO',
-        shelfLifeDays: 365,
-        marketplaceSkus: {
-          amazonSku: item.asin || sku,
-          ebayId: sku,
-          hdSku: sku,
-          warehouseId: 'se-18434'
+      const candidates = await Product.findAll({
+        where: {
+          companyId: companyId || 1,
+          alternativeSkus: { [Op.ne]: null }
         },
-        status: 'ACTIVE',
-        images: imagesList
+        attributes: ['id', 'sku', 'name', 'price', 'costPrice', 'images', 'clientId', 'alternativeSkus']
       });
-      console.log(`[Auto Product Create] Created new product in WMS: ${sku} - ${name} (Client: ${effectiveClientId || 'None'})`);
-    } catch (err) {
-      console.error(`[Auto Product Create Error] SKU ${sku}:`, err.message);
-      product = await Product.findOne({ where: { companyId: companyId || 1 } });
+
+      for (const cand of candidates) {
+        let alts = [];
+        if (typeof cand.alternativeSkus === 'string') {
+          try { alts = JSON.parse(cand.alternativeSkus); } catch (_) { alts = []; }
+        } else if (Array.isArray(cand.alternativeSkus)) {
+          alts = cand.alternativeSkus;
+        }
+        if (alts.some(a => {
+          const s = typeof a === 'string' ? a : a?.sku;
+          return s && s.trim().toLowerCase() === sku.toLowerCase();
+        })) {
+          product = cand;
+          console.log(`[ShipStation SKU Match]: Matched incoming SKU "${sku}" to Product "${cand.name}" (${cand.sku}) via Alternative SKU!`);
+          break;
+        }
+      }
+    } catch (altErr) {
+      console.warn('[Alternative SKU check warning]:', altErr.message);
     }
-  } else {
-    const updates = {};
-    if (productImageUrl && (!product.images || product.images.length === 0)) {
-      updates.images = [productImageUrl];
-    }
-    if (effectiveClientId && !product.clientId) {
-      updates.clientId = effectiveClientId;
-    }
-    if (Object.keys(updates).length > 0) {
-      try { await product.update(updates); } catch (e) { /* Ignore */ }
-    }
+  }
+
+  // 2. If still not found, check if it matches a Bundle SKU
+  if (!product) {
+    try {
+      const bundle = await Bundle.findOne({ where: { sku, companyId: companyId || 1 } });
+      if (bundle) {
+        console.log(`[ShipStation SKU Match]: Matched incoming SKU "${sku}" to Bundle "${bundle.name}"!`);
+        return { id: null, isBundleRecord: true, bundle, sku, name: bundle.name, price: Number(bundle.sellingPrice || 0) };
+      }
+    } catch (bErr) {}
+  }
+
+  if (!product) {
+    // POLICY: Automatic product creation from ShipStation is strictly disabled.
+    // Unmatched SKUs must NOT be auto-inserted into the catalog (routed to Product Pool).
+    console.warn(`[ShipStation Product Notice] SKU "${sku}" - "${name}" not found in WMS catalog. Skipping automatic product creation.`);
+    return null;
+  }
+
+  // Update existing product if needed
+  const updates = {};
+  if (productImageUrl && (!product.images || product.images.length === 0)) {
+    updates.images = [productImageUrl];
+  }
+  if (effectiveClientId && !product.clientId) {
+    updates.clientId = effectiveClientId;
+  }
+  if (Object.keys(updates).length > 0) {
+    try { await product.update(updates); } catch (e) { /* Ignore */ }
   }
 
   if (product && product.id) {
@@ -674,43 +678,35 @@ async function syncProductsFromShipStation(companyId) {
         await existing.update(updates);
         updated++;
       } else {
-        existing = await Product.create({
-          companyId: compId,
-          categoryId: category ? category.id : null,
-          name,
-          sku,
-          barcode,
-          price,
-          costPrice,
-          description: `${name} - Imported ShipStation Product`,
-          productType: 'SINGLE',
-          unitOfMeasure: 'Units',
-          vatRate: 20.00,
-          vatCode: 'STANDARD',
-          customsTariff: '1905.90.80',
-          weight: 200.00,
-          weightUnit: 'g',
-          length: 15.00,
-          width: 10.00,
-          height: 5.00,
-          dimensionUnit: 'cm',
-          reorderLevel: 10,
-          reorderQty: 50,
-          maxStock: 1000,
-          heatSensitive: 'NO',
-          perishable: 'NO',
-          requireBatchTracking: 'NO',
-          shelfLifeDays: 365,
-          marketplaceSkus: {
-            amazonSku: sku,
-            ebayId: sku,
-            hdSku: sku,
-            warehouseId: 'se-18434'
-          },
-          status: 'ACTIVE',
-          images: productImageUrl ? [productImageUrl] : null
-        });
-        created++;
+        // POLICY: Automatic creation of products from ShipStation is disabled.
+        // Instead, route/enrich into ProductPool with the exact name, image, barcode, and price from ShipStation!
+        const cleanSku = String(sku).trim();
+        if (cleanSku && cleanSku !== 'undefined' && cleanSku !== 'null') {
+          try {
+            const [poolItem, pCreated] = await ProductPool.findOrCreate({
+              where: { sku: cleanSku, companyId: compId },
+              defaults: {
+                companyId: compId,
+                sku: cleanSku,
+                name: name || cleanSku,
+                barcode: barcode || null,
+                unitPrice: price || 0,
+                imageUrl: productImageUrl || null,
+                channel: 'SHIPSTATION',
+                status: 'PENDING',
+                notes: 'Synced from ShipStation Product Catalog'
+              }
+            });
+            if (!pCreated && name && (poolItem.name.startsWith('Unmatched SKU') || !poolItem.name)) {
+              await poolItem.update({
+                name: name,
+                barcode: barcode || poolItem.barcode,
+                unitPrice: price > 0 ? price : poolItem.unitPrice,
+                imageUrl: productImageUrl || poolItem.imageUrl
+              });
+            }
+          } catch (_) {}
+        }
       }
 
       if (existing && existing.id) {
@@ -914,7 +910,7 @@ async function syncAllFromShipStation(companyId, options = {}) {
  * Sync Orders from ShipStation API (Central Order Hub)
  */
 async function syncOrdersFromShipStation(companyId, options = {}) {
-  const { apiKey, apiSecret, storeMappings } = await getShipStationConfig(companyId);
+  const { apiKey, apiSecret, storeMappings, orderSyncDays: configDays } = await getShipStationConfig(companyId);
   if (!apiKey) {
     console.log('[ShipStation] API Key not configured. Skipping live sync.');
     return { success: false, syncedCount: 0, message: 'ShipStation API Key missing. Please configure your Production Key under Integration Settings.' };
@@ -927,13 +923,15 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
     console.error('[ShipStation Warehouse Auto-Sync Warning]:', wErr.message);
   }
 
+  const daysPast = Math.max(1, Number(options.daysPast || options.orderSyncDays || configDays || 30));
+  const pastDate = new Date(Date.now() - daysPast * 24 * 3600 * 1000);
+  const pastDateStr = pastDate.toISOString().split('T')[0];
   const todayStr = new Date().toISOString().split('T')[0];
-  const past30DaysStr = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString().split('T')[0];
 
-  const startDate = options.startDate || past30DaysStr;
+  const startDate = options.startDate || pastDateStr;
   const endDate = options.endDate || todayStr;
 
-  console.log(`[ShipStation V2 Sync] Executing order sync for Company ${companyId} (Date Range: ${startDate} to ${endDate})...`);
+  console.log(`[ShipStation V2 Sync] Executing order sync for Company ${companyId} (Sync Window: Past ${daysPast} Days: ${startDate} to ${endDate})...`);
 
   let response = null;
   let lastErr = null;
@@ -949,23 +947,22 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
   const seenOrderKeys = new Set();
   const maxPagesToFetch = 100; // Fetch top pages per endpoint
 
+  // All endpoints are strictly bounded by date window (prevents 2259-day-old orders from ever being fetched)
   const endpointTemplates = [
-    // 1. ShipStation V2 - Latest Orders by create_date DESC (Range)
+    // 1. ShipStation V2 - Latest Orders by create_date (Range)
     (p) => `https://api.shipstation.com/v2/orders?page=${p}&page_size=500&sort_by=create_date&sort_dir=desc&create_date_start=${encodeURIComponent(startISO)}&create_date_end=${encodeURIComponent(endISO)}`,
-    // 2. ShipStation V2 - All Orders sorted by create_date DESC
-    (p) => `https://api.shipstation.com/v2/orders?page=${p}&page_size=500&sort_by=create_date&sort_dir=desc`,
-    // 3. ShipStation V2 - Awaiting Shipment Status
-    (p) => `https://api.shipstation.com/v2/orders?order_status=awaiting_shipment&page=${p}&page_size=500&sort_by=create_date&sort_dir=desc`,
-    // 4. ShipStation V2 - Shipped Status
-    (p) => `https://api.shipstation.com/v2/orders?order_status=shipped&page=${p}&page_size=500&sort_by=create_date&sort_dir=desc`,
-    // 5. ShipStation V2 - Latest Shipments by created_at DESC (Range)
-    (p) => `https://api.shipstation.com/v2/shipments?page=${p}&page_size=500&sort_by=created_at&sort_dir=desc&created_at_start=${encodeURIComponent(startISO)}`,
-    // 6. ShipStation V2 - All Shipments sorted by created_at DESC
-    (p) => `https://api.shipstation.com/v2/shipments?page=${p}&page_size=500&sort_by=created_at&sort_dir=desc`,
-    // 7. ShipStation V1 Fallback - Orders by OrderDate DESC (Range)
+    // 2. ShipStation V2 - Latest Orders by order_date (Range)
+    (p) => `https://api.shipstation.com/v2/orders?page=${p}&page_size=500&sort_by=order_date&sort_dir=desc&order_date_start=${encodeURIComponent(startISO)}&order_date_end=${encodeURIComponent(endISO)}`,
+    // 3. ShipStation V2 - Awaiting Shipment Status within Date Range
+    (p) => `https://api.shipstation.com/v2/orders?order_status=awaiting_shipment&page=${p}&page_size=500&sort_by=create_date&sort_dir=desc&create_date_start=${encodeURIComponent(startISO)}&create_date_end=${encodeURIComponent(endISO)}`,
+    // 4. ShipStation V2 - Shipped Status within Date Range
+    (p) => `https://api.shipstation.com/v2/orders?order_status=shipped&page=${p}&page_size=500&sort_by=create_date&sort_dir=desc&create_date_start=${encodeURIComponent(startISO)}&create_date_end=${encodeURIComponent(endISO)}`,
+    // 5. ShipStation V2 - Latest Shipments by created_at (Range)
+    (p) => `https://api.shipstation.com/v2/shipments?page=${p}&page_size=500&sort_by=created_at&sort_dir=desc&created_at_start=${encodeURIComponent(startISO)}&created_at_end=${encodeURIComponent(endISO)}`,
+    // 6. ShipStation V1 Fallback - Orders by OrderDate (Range)
     (p) => `https://ssapi.shipstation.com/orders?page=${p}&pageSize=500&sortBy=OrderDate&sortDir=DESC&orderDateStart=${encodeURIComponent(v1Start)}&orderDateEnd=${encodeURIComponent(v1End)}`,
-    // 8. ShipStation V1 Fallback - Awaiting Shipment
-    (p) => `https://ssapi.shipstation.com/orders?page=${p}&pageSize=500&sortBy=OrderDate&sortDir=DESC&orderStatus=awaiting_shipment`
+    // 7. ShipStation V1 Fallback - Orders by CreateDate (Range)
+    (p) => `https://ssapi.shipstation.com/orders?page=${p}&pageSize=500&sortBy=CreateDate&sortDir=DESC&createDateStart=${encodeURIComponent(v1Start)}&createDateEnd=${encodeURIComponent(v1End)}`
   ];
 
   for (const epFn of endpointTemplates) {
@@ -992,7 +989,18 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
           const fetched = res.data.shipments || res.data.orders || (Array.isArray(res.data) ? res.data : []);
           if (Array.isArray(fetched) && fetched.length > 0) {
             let newInPage = 0;
+            const minAllowedTime = pastDate.getTime() - 24 * 3600 * 1000; // 1-day buffer for timezone offset
             for (const item of fetched) {
+              // Strict Filter: Never process orders older than daysPast window (prevents 2259-day-old orders)
+              const rawDate = item.order_date || item.orderDate || item.create_date || item.createDate || item.created_at || item.createdAt;
+              if (rawDate) {
+                const itemTime = new Date(rawDate).getTime();
+                if (!isNaN(itemTime) && itemTime < minAllowedTime) {
+                  // Order is older than daysPast window -> skip!
+                  continue;
+                }
+              }
+
               const rawKey = String(item.shipment_id || item.shipmentId || item.orderId || item.id || item.orderNumber || item.order_number || '');
               if (rawKey && rawKey !== 'undefined' && !seenOrderKeys.has(rawKey)) {
                 seenOrderKeys.add(rawKey);
@@ -1050,6 +1058,17 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
     }
 
     for (const ssOrder of orders) {
+      // Date Window Enforcement: Strictly ensure order date is within [startDate, endDate]
+      const rawDate = ssOrder.orderDate || ssOrder.order_date || ssOrder.create_date || ssOrder.created_at || ssOrder.ship_date;
+      if (rawDate) {
+        const itemTime = new Date(rawDate).getTime();
+        const minAllowedTime = new Date(`${startDate}T00:00:00Z`).getTime() - (12 * 3600 * 1000); // 12hr buffer for timezone differences
+        const maxAllowedTime = new Date(`${endDate}T23:59:59Z`).getTime() + (12 * 3600 * 1000);
+        if (itemTime < minAllowedTime || itemTime > maxAllowedTime) {
+          continue; // Order is outside user's selected date window
+        }
+      }
+
       const rawId = ssOrder.orderId || ssOrder.id || ssOrder.shipment_id || ssOrder.shipmentId || ssOrder.sales_order_id || ssOrder.salesOrderId || ssOrder.order_id;
       const validRawId = (rawId && String(rawId) !== 'undefined' && String(rawId) !== 'null') ? String(rawId) : null;
       const shipstationOrderId = validRawId || `SS-${ssOrder.orderNumber || ssOrder.order_number || Date.now()}-${Math.floor(Math.random()*10000)}`;
@@ -1213,6 +1232,15 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
             }
           }
         }
+
+        // Trigger Amazon Customization ZIP extraction & SKU conversion on existing orders as well
+        try {
+          const amazonCustomService = require('../../services/amazonCustomService');
+          await amazonCustomService.processOrderCustomizations(existingOrder.id);
+        } catch (customErr) {
+          // Ignore
+        }
+
         updatedCount++;
         syncedCount++;
       } else {
@@ -1265,11 +1293,92 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
             let unitPrice = parseFloat(item.unitPrice || item.unit_price || item.price || item.unitCost || item.cost || 0);
             const productImageUrl = extractProductImage(item, null);
 
-            // Auto-create or fetch product from WMS catalog
+            // Comprehensive customizedUrl extraction
+            let customUrl = item.customizedUrl || item.customized_url || null;
+            let itemOptions = item.options;
+            if (typeof itemOptions === 'string') {
+              try { itemOptions = JSON.parse(itemOptions); } catch (_) {}
+            }
+            if (!customUrl && Array.isArray(itemOptions)) {
+              const opt = itemOptions.find(o => {
+                const n = String(o.name || '').toLowerCase();
+                const v = String(o.value || '').toLowerCase();
+                return n.includes('custom') || n === 'customized-url' || v.includes('.zip') || v.includes('amazon') || v.startsWith('http');
+              });
+              if (opt) customUrl = opt.value;
+            }
+            if (!customUrl) {
+              const allNotesText = [
+                ssOrder.notes,
+                ssOrder.internalNotes,
+                ssOrder.customerNotes,
+                ssOrder.giftNote,
+                ssOrder.advancedOptions?.customField1,
+                ssOrder.advancedOptions?.customField2,
+                ssOrder.advancedOptions?.customField3
+              ].filter(Boolean).join(' ');
+              const urlMatch = allNotesText.match(/https?:\/\/[^\s"',;]+(?:\.zip|[^\s"',;]*(?:custom|amazon|sellercentral)[^\s"',;]*)/i);
+              if (urlMatch) customUrl = urlMatch[0].trim();
+            }
+
+            // Fetch product from WMS catalog (auto-creation disabled, checks main SKU, alt SKUs, bundles)
             const product = await getOrCreateProductFromChannelItem({ ...item, sku, unitPrice, quantity }, companyId || 1, productImageUrl, storeClientId);
-            if (!product || !product.id) {
-              console.error('[OrderItem Create Skip]: Failed to resolve product for SKU:', sku);
-              continue;
+            
+            const isBundleMatch = product && product.isBundleRecord;
+            if (isBundleMatch) {
+              hasBundle = true;
+            }
+
+            const isCustomParentSku = (sku && ['SF_3', 'NA_M_12'].includes(sku)) || !!customUrl;
+
+            const finalImg = productImageUrl || (product && !product.isBundleRecord ? firstProductImage(product.images) : null);
+
+            if (!product && !isCustomParentSku) {
+              console.warn(`[ShipStation Order Item Notice]: Order ${orderNumber} contains SKU "${sku}" which is not in WMS catalog. Skipping automatic product creation and routing to Product Pool.`);
+              const unmatchedNote = `[WARNING: Unmatched SKU "${sku}" - Routed to Product Pool]`;
+              if (!existingOrder.internalNotes || !existingOrder.internalNotes.includes(unmatchedNote)) {
+                try {
+                  await existingOrder.update({
+                    internalNotes: existingOrder.internalNotes ? `${existingOrder.internalNotes} | ${unmatchedNote}` : unmatchedNote
+                  });
+                } catch (e) { /* ignore */ }
+              }
+
+              // Send to Product Pool for manual resolution by Zoltan
+              try {
+                const cleanSku = String(sku || '').trim();
+                const itemName = item ? (item.name || item.title || item.label || item.description || cleanSku) : cleanSku;
+                if (cleanSku && cleanSku !== 'undefined' && cleanSku !== 'null') {
+                  const [poolItem, pCreated] = await ProductPool.findOrCreate({
+                    where: {
+                      companyId: companyId || 1,
+                      sku: cleanSku,
+                      status: 'PENDING'
+                    },
+                    defaults: {
+                      companyId: companyId || 1,
+                      sku: cleanSku,
+                      name: itemName || cleanSku,
+                      channel: salesChannel || 'SHIPSTATION',
+                      orderNumber,
+                      imageUrl: finalImg || null,
+                      unitPrice: unitPrice || 0,
+                      status: 'PENDING',
+                      notes: `Detected from ShipStation Order ${orderNumber}`
+                    }
+                  });
+                  if (!pCreated && itemName && (poolItem.name.startsWith('Unmatched SKU') || !poolItem.name || poolItem.name === cleanSku)) {
+                    await poolItem.update({
+                      name: itemName,
+                      imageUrl: finalImg || poolItem.imageUrl,
+                      unitPrice: unitPrice > 0 ? unitPrice : poolItem.unitPrice
+                    });
+                  }
+                  console.log(`[Product Pool] Routed unknown SKU "${cleanSku}" (${itemName}) from Order ${orderNumber} to Product Pool`);
+                }
+              } catch (poolErr) {
+                console.warn('[Product Pool Insert Warning]:', poolErr.message);
+              }
             }
 
             if (unitPrice === 0 && product && Number(product.price) > 0) {
@@ -1282,18 +1391,13 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
               }
             }
 
-            const isBundleItem = sku && String(sku).includes('SEL_'); // Bundle SKU pattern
+            const isBundleItem = (sku && String(sku).includes('SEL_')) || !!isBundleMatch; // Bundle SKU pattern or matched bundle
             if (isBundleItem) hasBundle = true;
 
-
-
-            const finalImg = productImageUrl || (product ? firstProductImage(product.images) : null);
-
-            const customUrl = item.customizedUrl || item.customized_url || (item.options?.find(o => o.name === 'CustomizedURL' || o.name === 'Customized URL')?.value) || (ssOrder.notes && ssOrder.notes.includes('CustomizedURL:') ? ssOrder.notes.split('CustomizedURL:')[1]?.trim()?.split(/\s+/)[0] : null);
-
-            await OrderItem.create({
+            const orderItemPayload = {
               salesOrderId: existingOrder.id,
-              productId: product.id,
+              productId: (product && !product.isBundleRecord) ? product.id : null,
+              name: item ? (item.name || item.title || item.label || item.description || null) : null,
               quantity,
               scannedQty: 0,
               unitPrice,
@@ -1304,7 +1408,30 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
               customizedUrl: customUrl,
               bestBeforeDate: item.options?.find(o => o.name === 'BB Date')?.value || null,
               batchNumber: item.options?.find(o => o.name === 'Batch ID')?.value || null
-            });
+            };
+
+            try {
+              await OrderItem.create(orderItemPayload);
+            } catch (oiErr) {
+              // Fallback if DB table requires non-null product_id: assign to a single shared Unmatched Pool product
+              try {
+                let poolProduct = await Product.findOne({ where: { sku: 'UNMATCHED-POOL', companyId: companyId || 1 } });
+                if (!poolProduct) {
+                  poolProduct = await Product.create({
+                    companyId: companyId || 1,
+                    name: 'Unmatched Products Pool',
+                    sku: 'UNMATCHED-POOL',
+                    barcode: 'UNMATCHED-POOL',
+                    description: 'Single pool placeholder for orders containing items not present in WMS catalog',
+                    status: 'ACTIVE'
+                  });
+                }
+                orderItemPayload.productId = poolProduct.id;
+                await OrderItem.create(orderItemPayload);
+              } catch (poolErr) {
+                console.error('[OrderItem Create Fallback Error]:', poolErr.message);
+              }
+            }
           }
 
           if (hasBundle) {
@@ -1708,6 +1835,194 @@ async function syncStockToShipStation(sku, stockQuantity, companyId) {
   }
 }
 
+async function enrichPoolFromShipStation(companyId = 1) {
+  const compId = companyId || 1;
+  let enrichedCount = 0;
+
+  try {
+    const { Op } = require('sequelize');
+
+    // 1. Clean any corrupted/undefined items from pool
+    await sequelize.query(`
+      DELETE FROM product_pool 
+      WHERE LOWER(TRIM(sku)) IN ('undefined', 'null', '', 'unmatched-pool') 
+         OR sku IS NULL 
+         OR LOWER(TRIM(name)) LIKE '%undefined%' 
+         OR LOWER(TRIM(name)) = 'unmatched sku (undefined)'
+    `).catch(() => {});
+
+    // Ensure all columns exist in product_pool
+    await sequelize.query("ALTER TABLE product_pool ADD COLUMN barcode VARCHAR(255) NULL").catch(() => {});
+    await sequelize.query("ALTER TABLE product_pool ADD COLUMN weight VARCHAR(100) NULL").catch(() => {});
+    await sequelize.query("ALTER TABLE product_pool ADD COLUMN cost_price DECIMAL(12,2) DEFAULT 0.00").catch(() => {});
+    await sequelize.query("ALTER TABLE product_pool ADD COLUMN raw_details LONGTEXT NULL").catch(() => {});
+    await sequelize.query("ALTER TABLE order_items ADD COLUMN name VARCHAR(255) NULL").catch(() => {});
+
+    const ssItemMap = new Map();
+
+    const registerItem = (it, originChannel = 'SHIPSTATION', orderNum = null) => {
+      if (!it || typeof it !== 'object') return;
+      const rawSku = it.sku || it.item_sku || it.product_sku || it.seller_sku || it.line_item_sku;
+      const cleanSku = String(rawSku || '').trim();
+      if (!cleanSku || cleanSku === 'undefined' || cleanSku === 'null' || cleanSku === 'UNMATCHED-POOL') return;
+
+      const key = cleanSku.toLowerCase();
+      const rawName = it.name || it.title || it.label || it.description || it.item_name || it.product_name;
+      const cleanName = (rawName && typeof rawName === 'string') ? rawName.trim() : null;
+      const img = extractProductImage(it, null);
+      const price = parseFloat(it.unit_price || it.unitPrice || it.price || it.unitCost || it.cost || 0) || 0;
+      const cost = parseFloat(it.cost || it.cost_price || it.costPrice || it.default_cost || 0) || 0;
+      const barcode = it.upc || it.barcode || it.gtin || it.asin || null;
+      let weight = null;
+      if (it.weight) {
+        weight = typeof it.weight === 'object' ? `${it.weight.value || ''} ${it.weight.units || 'oz'}`.trim() : String(it.weight);
+      } else if (it.weight_oz != null) {
+        weight = `${it.weight_oz} oz`;
+      }
+
+      const existing = ssItemMap.get(key);
+      if (!existing) {
+        ssItemMap.set(key, {
+          sku: cleanSku,
+          name: cleanName,
+          imageUrl: img,
+          unitPrice: price,
+          costPrice: cost,
+          barcode,
+          weight,
+          channel: originChannel,
+          orderNumber: orderNum,
+          rawDetails: JSON.stringify(it)
+        });
+      } else {
+        // Enrich existing entry with better details
+        if (cleanName && (!existing.name || existing.name === existing.sku || existing.name.startsWith('Unmatched SKU'))) {
+          existing.name = cleanName;
+        }
+        if (img && !existing.imageUrl) existing.imageUrl = img;
+        if (price > 0 && (!existing.unitPrice || existing.unitPrice === 0)) existing.unitPrice = price;
+        if (cost > 0 && (!existing.costPrice || existing.costPrice === 0)) existing.costPrice = cost;
+        if (barcode && !existing.barcode) existing.barcode = barcode;
+        if (weight && !existing.weight) existing.weight = weight;
+        if (orderNum && !existing.orderNumber) existing.orderNumber = orderNum;
+      }
+    };
+
+    // 2. Query ShipStation V2 Orders (multiple pages for comprehensive item titles & prices)
+    const v2OrderEndpoints = [
+      'https://api.shipstation.com/v2/orders?page=1&page_size=500&sort_by=create_date&sort_dir=desc',
+      'https://api.shipstation.com/v2/orders?page=2&page_size=500&sort_by=create_date&sort_dir=desc',
+      'https://api.shipstation.com/v2/orders?page=1&page_size=500&sort_by=order_date&sort_dir=desc',
+      'https://api.shipstation.com/v2/shipments?page=1&page_size=500&sort_by=created_at&sort_dir=desc',
+      'https://api.shipstation.com/v2/shipments?page=2&page_size=500&sort_by=created_at&sort_dir=desc'
+    ];
+
+    for (const ep of v2OrderEndpoints) {
+      try {
+        const res = await makeShipStationRequest(compId, ep);
+        if (res && res.data) {
+          const ordersOrShipments = res.data.orders || res.data.shipments || (Array.isArray(res.data) ? res.data : []);
+          if (Array.isArray(ordersOrShipments)) {
+            for (const o of ordersOrShipments) {
+              const orderNum = o.order_number || o.orderNumber || o.order_id || o.orderId;
+              const ch = o.marketplace || o.sales_channel || o.order_source || 'SHIPSTATION';
+              const items = o.items || o.shipment_items || o.packages || o.line_items || [];
+              if (Array.isArray(items)) {
+                for (const it of items) {
+                  registerItem(it, ch, orderNum);
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    // 3. Query ShipStation Products Catalog API
+    const catalogEndpoints = [
+      'https://api.shipstation.com/v2/products?page_size=500',
+      'https://ssapi.shipstation.com/products?pageSize=500'
+    ];
+    for (const ep of catalogEndpoints) {
+      try {
+        const res = await makeShipStationRequest(compId, ep);
+        if (res && res.data) {
+          const list = Array.isArray(res.data) ? res.data : (res.data.products || []);
+          if (Array.isArray(list) && list.length > 0) {
+            for (const sp of list) {
+              registerItem(sp, 'SHIPSTATION');
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    // 4. Update ProductPool items with real ShipStation V2 details
+    const poolItems = await ProductPool.findAll({ where: { companyId: compId } });
+
+    for (const poolItem of poolItems) {
+      const skuKey = poolItem.sku.trim().toLowerCase();
+      const match = ssItemMap.get(skuKey);
+
+      if (match) {
+        const updates = {};
+        const isPlaceholderName = !poolItem.name || 
+          poolItem.name.startsWith('Unmatched SKU') || 
+          poolItem.name === poolItem.sku || 
+          poolItem.name.toLowerCase().includes('undefined');
+
+        if (match.name && isPlaceholderName) {
+          updates.name = match.name;
+        }
+        if (match.imageUrl && !poolItem.imageUrl) {
+          updates.imageUrl = match.imageUrl;
+        }
+        if (match.unitPrice > 0 && (!poolItem.unitPrice || Number(poolItem.unitPrice) === 0)) {
+          updates.unitPrice = match.unitPrice;
+        }
+        if (match.barcode && !poolItem.barcode) {
+          updates.barcode = match.barcode;
+        }
+        if (match.weight && !poolItem.weight) {
+          updates.weight = match.weight;
+        }
+        if (match.costPrice > 0 && (!poolItem.costPrice || Number(poolItem.costPrice) === 0)) {
+          updates.costPrice = match.costPrice;
+        }
+        if (match.rawDetails && !poolItem.rawDetails) {
+          updates.rawDetails = match.rawDetails;
+        }
+        if (match.orderNumber && !poolItem.orderNumber) {
+          updates.orderNumber = match.orderNumber;
+        }
+
+        if (Object.keys(updates).length > 0) {
+          await poolItem.update(updates);
+          enrichedCount++;
+        }
+
+        // Also backfill real name into order_items table in MySQL
+        if (match.name) {
+          await sequelize.query(`
+            UPDATE order_items 
+            SET name = :name 
+            WHERE (name IS NULL OR name = '' OR name LIKE 'Unmatched SKU%') 
+              AND LOWER(TRIM(original_sku)) = :sku
+          `, {
+            replacements: { name: match.name, sku: skuKey }
+          }).catch(() => {});
+        }
+      }
+    }
+
+    console.log(`[enrichPoolFromShipStation Complete] Processed ${ssItemMap.size} unique SKUs from ShipStation V2 API, enriched ${enrichedCount} product pool items.`);
+  } catch (err) {
+    console.warn('[enrichPoolFromShipStation Warning]:', err.message);
+  }
+
+  return enrichedCount;
+}
+
 module.exports = {
   testConnection,
   syncAllFromShipStation,
@@ -1733,5 +2048,6 @@ module.exports = {
   getInventoryLocations,
   getUsers,
   fetchLiveShipStationOrderData,
-  syncStockToShipStation
+  syncStockToShipStation,
+  enrichPoolFromShipStation
 };

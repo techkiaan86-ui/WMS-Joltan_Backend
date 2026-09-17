@@ -244,32 +244,11 @@ async function scanBarcode(reqUser, barcode) {
 }
 
 async function listProducts(reqUser, query = {}) {
-  // Dynamic Hot-Backfill: Check if any products have null clientId and backfill them
-  try {
-    const nullClientProducts = await Product.findAll({ where: { clientId: null } });
-    if (nullClientProducts.length > 0) {
-      console.log(`[HOT-BACKFILL] Backfilling clientId for ${nullClientProducts.length} legacy products...`);
-      let defaultClient = await Customer.findOne({ where: { companyId: nullClientProducts[0].companyId } });
-      if (!defaultClient) {
-        defaultClient = await Customer.create({
-          companyId: nullClientProducts[0].companyId,
-          name: '',
-          code: 'DFTCL',
-          status: 'ACTIVE'
-        });
-      }
-      for (const p of nullClientProducts) {
-        await p.update({ clientId: defaultClient.id });
-      }
-      console.log('[HOT-BACKFILL] Product clientId backfill complete.');
-    }
-  } catch (e) {
-    console.warn('[HOT-BACKFILL] Failed to backfill product clientId:', e.message);
-  }
-
   const where = {};
   if (reqUser.role !== 'super_admin') where.companyId = reqUser.companyId;
   else if (query.companyId) where.companyId = query.companyId;
+
+  where.sku = { [Op.ne]: 'UNMATCHED-POOL' };
 
   if (reqUser.clientId) {
     where.clientId = reqUser.clientId;
@@ -633,15 +612,17 @@ async function createProduct(data, reqUser) {
   }
 
   const clientId = data.clientId || null;
-  if (!clientId) throw new Error('Client/Owner is required');
+  let companyId = reqUser.companyId || (data.companyId ? Number(data.companyId) : 1);
 
-  const client = await Customer.findByPk(clientId);
-  if (!client) throw new Error('Selected client not found');
-  const companyId = client.companyId;
-  if (!companyId) throw new Error('Company not found for the selected client');
+  if (clientId) {
+    const client = await Customer.findByPk(clientId);
+    if (client && client.companyId) {
+      companyId = client.companyId;
+    }
+  }
 
-  const existing = await Product.findOne({ where: { companyId, clientId, sku: data.sku.trim() } });
-  if (existing) throw new Error('SKU already exists for this client');
+  const existing = await Product.findOne({ where: { companyId, clientId: clientId || null, sku: data.sku.trim() } });
+  if (existing) throw new Error(clientId ? 'SKU already exists for this client' : 'SKU already exists');
   const packSize = data.packSize != null ? Number(data.packSize) : 1;
   const rawCost = data.costPrice != null ? Number(data.costPrice) : 0;
   // We store costPrice as unit cost in the database
@@ -759,10 +740,12 @@ async function bulkCreateProducts(productsArray, reqUser, explicitCompanyId) {
         continue;
       }
 
-      // Resolve clientId (ID, Name, or Code)
+      // Resolve clientId (ID, Name, or Code) - OPTIONAL as requested by Zoltan
       let resolvedClientId = null;
+      let resolvedCompanyId = companyId;
+
       const clientInput = data.client != null ? String(data.client).trim() : (data.clientId != null ? String(data.clientId).trim() : null);
-      if (clientInput !== null && clientInput !== '') {
+      if (clientInput !== null && clientInput !== '' && !['not assigned', 'none', 'null', 'unassigned', '-', 'n/a'].includes(clientInput.toLowerCase())) {
         if (!isNaN(clientInput) && clientIdSet.has(Number(clientInput))) {
           resolvedClientId = Number(clientInput);
         } else {
@@ -770,23 +753,20 @@ async function bulkCreateProducts(productsArray, reqUser, explicitCompanyId) {
           if (clientMap.has(lowerClient)) {
             resolvedClientId = clientMap.get(lowerClient);
           } else {
-            throw new Error(`Client/Owner "${clientInput}" not found`);
+            console.warn(`[BULK_IMPORT] Row ${i + 1}: Client "${clientInput}" not recognized. Creating product with Client: Not Assigned.`);
+            resolvedClientId = null;
           }
-        }
-      } else {
-        if (existingClients.length === 1) {
-          resolvedClientId = existingClients[0].id;
-        } else {
-          throw new Error('Client/Owner is required');
         }
       }
 
-      const clientRecord = await Customer.findByPk(resolvedClientId);
-      if (!clientRecord) throw new Error('Resolved client not found');
-      const resolvedCompanyId = clientRecord.companyId;
-      if (!resolvedCompanyId) throw new Error('Company not found for the client');
+      if (resolvedClientId) {
+        const clientRecord = await Customer.findByPk(resolvedClientId);
+        if (clientRecord && clientRecord.companyId) {
+          resolvedCompanyId = clientRecord.companyId;
+        }
+      }
 
-      const existing = await Product.findOne({ where: { companyId: resolvedCompanyId, clientId: resolvedClientId, sku: String(data.sku).trim() } });
+      const existing = await Product.findOne({ where: { companyId: resolvedCompanyId, clientId: resolvedClientId || null, sku: String(data.sku).trim() } });
 
       // Resolve categoryId (ID or Name)
       let resolvedCategoryId = null;
@@ -956,26 +936,25 @@ async function updateProduct(id, data, reqUser) {
   const newSku = (data.sku !== undefined) ? data.sku?.trim() : product.sku;
   const newClientId = (data.clientId !== undefined) ? (data.clientId || null) : product.clientId;
 
-  if (!newClientId) {
-    throw new Error('Client/Owner is required');
+  let companyId = product.companyId || reqUser.companyId || 1;
+  if (newClientId) {
+    const client = await Customer.findByPk(newClientId);
+    if (client && client.companyId) {
+      companyId = client.companyId;
+    }
   }
-
-  const client = await Customer.findByPk(newClientId);
-  if (!client) throw new Error('Selected client not found');
-  const companyId = client.companyId;
-  if (!companyId) throw new Error('Company not found for the selected client');
 
   if (data.sku !== undefined || data.clientId !== undefined) {
     const existing = await Product.findOne({
       where: {
         companyId,
-        clientId: newClientId,
+        clientId: newClientId || null,
         sku: newSku,
         id: { [Op.ne]: product.id }
       }
     });
     if (existing) {
-      throw new Error('SKU already exists for this client');
+      throw new Error(newClientId ? 'SKU already exists for this client' : 'SKU already exists');
     }
   }
 
@@ -1096,63 +1075,138 @@ async function addAlternativeSku(productId, payload, reqUser) {
   return normalizeProductJson(updated || product);
 }
 
+async function checkProductInUse(productId) {
+  const {
+    ProductStock,
+    Inventory,
+    OrderItem,
+    SalesOrder,
+    PurchaseOrderItem,
+    PurchaseOrder
+  } = require('../models');
+
+  // 1. Check if physical stock exists (> 0) or reserved stock exists (> 0)
+  const stockRow = await ProductStock.findOne({
+    where: {
+      productId,
+      [Op.or]: [
+        { quantity: { [Op.gt]: 0 } },
+        { reserved: { [Op.gt]: 0 } }
+      ]
+    }
+  });
+  if (stockRow) {
+    return { inUse: true, reason: 'This product is in use (active warehouse stock).' };
+  }
+
+  const invRow = await Inventory.findOne({
+    where: {
+      productId,
+      [Op.or]: [
+        { quantity: { [Op.gt]: 0 } },
+        { reservedQuantity: { [Op.gt]: 0 } }
+      ]
+    }
+  });
+  if (invRow) {
+    return { inUse: true, reason: 'This product is in use (active inventory).' };
+  }
+
+  // 2. Check if product is in an active / unfulfilled sales order
+  const completedOrderStatuses = ['CANCELLED', 'DISPATCHED', 'DELIVERED', 'SHIPPED', 'COMPLETED'];
+  const activeOrderItem = await OrderItem.findOne({
+    where: { productId },
+    include: [{
+      model: SalesOrder,
+      as: 'SalesOrder',
+      required: true,
+      where: {
+        status: { [Op.notIn]: completedOrderStatuses }
+      }
+    }]
+  });
+  if (activeOrderItem) {
+    return { inUse: true, reason: 'This product is in use (active order).' };
+  }
+
+  // 3. Check if product is in an open purchase order
+  const completedPoStatuses = ['RECEIVED', 'CANCELLED', 'CLOSED', 'COMPLETED'];
+  const activePoItem = await PurchaseOrderItem.findOne({
+    where: { productId },
+    include: [{
+      model: PurchaseOrder,
+      required: true,
+      where: {
+        status: { [Op.notIn]: completedPoStatuses }
+      }
+    }]
+  });
+  if (activePoItem) {
+    return { inUse: true, reason: 'This product is in use (open PO).' };
+  }
+
+  return { inUse: false };
+}
+
 async function removeProduct(id, reqUser) {
   const product = await Product.findByPk(id);
   if (!product) throw new Error('Product not found');
   if (reqUser.role !== 'super_admin' && product.companyId !== reqUser.companyId) throw new Error('Product not found');
 
+  // Validate if product is currently in use
+  const usage = await checkProductInUse(id);
+  if (usage.inUse) {
+    throw new Error('This product is in use and cannot be deleted.');
+  }
+
   const {
     ProductStock,
     OrderItem,
+    PickListItem,
     PurchaseOrderItem,
     GoodsReceiptItem,
     Inventory,
     InventoryLog,
+    InventoryAdjustment,
     BundleItem,
     Batch,
     Movement,
     ReplenishmentTask,
-    ReplenishmentConfig
+    ReplenishmentConfig,
+    SupplierProduct,
+    ProductPool
   } = require('../models');
 
-  // Check if product is in service
-  const stockExists = await ProductStock.findOne({ where: { productId: id } });
-  const orderExists = await OrderItem.findOne({ where: { productId: id } });
-  const poExists = await PurchaseOrderItem.findOne({ where: { productId: id } });
-  const grExists = await GoodsReceiptItem.findOne({ where: { productId: id } });
-  const invExists = await Inventory.findOne({ where: { productId: id } });
-  const logExists = await InventoryLog.findOne({ where: { productId: id } });
-  const bundleExists = await BundleItem.findOne({ where: { productId: id } });
-  const batchExists = await Batch.findOne({ where: { productId: id } });
-  const movementExists = await Movement.findOne({ where: { productId: id } });
-  const repTaskExists = await ReplenishmentTask.findOne({ where: { productId: id } });
-  const repConfigExists = await ReplenishmentConfig.findOne({ where: { productId: id } });
+  await sequelize.transaction(async (t) => {
+    // Disable foreign key checks for permanent cleanup
+    await sequelize.query('SET FOREIGN_KEY_CHECKS = 0', { transaction: t });
 
-  if (
-    stockExists ||
-    orderExists ||
-    poExists ||
-    grExists ||
-    invExists ||
-    logExists ||
-    bundleExists ||
-    batchExists ||
-    movementExists ||
-    repTaskExists ||
-    repConfigExists
-  ) {
-    throw new Error("Product is in service.");
-  }
+    // Unlink order items and PO items so order history remains intact without foreign key lock
+    if (OrderItem) await OrderItem.update({ productId: null }, { where: { productId: id }, transaction: t }).catch(() => {});
+    if (PurchaseOrderItem) await PurchaseOrderItem.update({ productId: null }, { where: { productId: id }, transaction: t }).catch(() => {});
+    if (GoodsReceiptItem) await GoodsReceiptItem.update({ productId: null }, { where: { productId: id }, transaction: t }).catch(() => {});
+    if (ProductPool) await ProductPool.update({ resolvedProductId: null }, { where: { resolvedProductId: id }, transaction: t }).catch(() => {});
 
-  try {
-    await sequelize.transaction(async (t) => {
-      await ProductStock.destroy({ where: { productId: id }, transaction: t });
-      await product.destroy({ transaction: t });
-    });
-    return { message: 'Product deleted successfully' };
-  } catch (err) {
-    throw new Error("Product is in service.");
-  }
+    // Destroy product-specific records
+    if (PickListItem) await PickListItem.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (BundleItem) await BundleItem.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (ProductStock) await ProductStock.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (Inventory) await Inventory.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (InventoryLog) await InventoryLog.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (InventoryAdjustment) await InventoryAdjustment.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (Movement) await Movement.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (Batch) await Batch.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (ReplenishmentTask) await ReplenishmentTask.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (ReplenishmentConfig) await ReplenishmentConfig.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+    if (SupplierProduct) await SupplierProduct.destroy({ where: { productId: id }, transaction: t }).catch(() => {});
+
+    // Permanently destroy the product
+    await product.destroy({ transaction: t });
+
+    await sequelize.query('SET FOREIGN_KEY_CHECKS = 1', { transaction: t });
+  });
+
+  return { success: true, message: 'Product permanently deleted from database.' };
 }
 
 async function createCategory(data, reqUser) {
@@ -3805,26 +3859,108 @@ async function bulkActionProducts(action, productIds, reqUser) {
     whereClause.companyId = reqUser.companyId;
   }
 
-  if (action === 'DELETE') {
-    let deletedCount = 0;
-    let deactivatedCount = 0;
-    const products = await Product.findAll({ where: whereClause });
+  const {
+    ProductStock,
+    OrderItem,
+    PurchaseOrderItem,
+    GoodsReceiptItem,
+    Inventory,
+    InventoryLog,
+    BundleItem,
+    Batch,
+    Movement,
+    ReplenishmentTask,
+    ReplenishmentConfig,
+    SupplierProduct
+  } = require('../models');
 
-    for (const product of products) {
-      try {
-        await sequelize.transaction(async (t) => {
-          await ProductStock.destroy({ where: { productId: product.id }, transaction: t });
-          await product.destroy({ transaction: t });
-        });
-        deletedCount++;
-      } catch (err) {
-        await product.update({ status: 'INACTIVE' });
-        deactivatedCount++;
+  if (action === 'DELETE') {
+    const products = await Product.findAll({ where: whereClause, attributes: ['id'] });
+    if (products.length === 0) {
+      return { message: 'No products found to delete.' };
+    }
+
+    const inUseIds = [];
+    const productIdsToDelete = [];
+
+    for (const p of products) {
+      const usage = await checkProductInUse(p.id);
+      if (usage.inUse) {
+        inUseIds.push(p.id);
+      } else {
+        productIdsToDelete.push(p.id);
       }
     }
-    return { message: `Successfully deleted ${deletedCount} products. Deactivated ${deactivatedCount} products due to linked records.` };
+
+    if (productIdsToDelete.length === 0) {
+      return {
+        success: false,
+        inUseCount: inUseIds.length,
+        message: 'This product is in use and cannot be deleted.'
+      };
+    }
+
+    const {
+      ProductStock,
+      OrderItem,
+      PickListItem,
+      PurchaseOrderItem,
+      GoodsReceiptItem,
+      Inventory,
+      InventoryLog,
+      InventoryAdjustment,
+      BundleItem,
+      Batch,
+      Movement,
+      ReplenishmentTask,
+      ReplenishmentConfig,
+      SupplierProduct,
+      ProductPool
+    } = require('../models');
+
+    await sequelize.transaction(async (t) => {
+      await sequelize.query('SET FOREIGN_KEY_CHECKS = 0', { transaction: t });
+
+      if (OrderItem) await OrderItem.update({ productId: null }, { where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (PurchaseOrderItem) await PurchaseOrderItem.update({ productId: null }, { where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (GoodsReceiptItem) await GoodsReceiptItem.update({ productId: null }, { where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (ProductPool) await ProductPool.update({ resolvedProductId: null }, { where: { resolvedProductId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+
+      if (PickListItem) await PickListItem.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (BundleItem) await BundleItem.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (ProductStock) await ProductStock.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (Inventory) await Inventory.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (InventoryLog) await InventoryLog.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (InventoryAdjustment) await InventoryAdjustment.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (Movement) await Movement.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (Batch) await Batch.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (ReplenishmentTask) await ReplenishmentTask.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (ReplenishmentConfig) await ReplenishmentConfig.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+      if (SupplierProduct) await SupplierProduct.destroy({ where: { productId: { [Op.in]: productIdsToDelete } }, transaction: t }).catch(() => {});
+
+      // Permanently destroy all non-in-use selected products from database
+      await Product.destroy({ where: { id: { [Op.in]: productIdsToDelete } }, transaction: t });
+
+      await sequelize.query('SET FOREIGN_KEY_CHECKS = 1', { transaction: t });
+    });
+
+    if (inUseIds.length > 0) {
+      return {
+        success: true,
+        deletedCount: productIdsToDelete.length,
+        inUseCount: inUseIds.length,
+        message: `Successfully deleted ${productIdsToDelete.length} products. Skipped ${inUseIds.length} products because this product is in use.`
+      };
+    }
+
+    return {
+      success: true,
+      deletedCount: productIdsToDelete.length,
+      inUseCount: 0,
+      message: `Successfully permanently deleted ${productIdsToDelete.length} products from database.`
+    };
   } else if (action === 'Mark Discontinued') {
-    const updatedCount = await Product.update({ status: 'INACTIVE' }, { where: whereClause });
+    const updatedCount = await Product.update({ status: 'INACTIVE', isDiscontinued: true }, { where: whereClause });
     return { message: `Successfully marked ${updatedCount[0]} products as discontinued (INACTIVE).` };
   } else {
     throw new Error('Invalid bulk action');

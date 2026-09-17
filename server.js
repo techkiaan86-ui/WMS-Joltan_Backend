@@ -134,27 +134,21 @@ app.delete('/api/inventory/products/:id', authenticate, requireRole(...invProduc
 // POST /api/products/:id/alternative-skus (same handler as inventory, so client can call either path)
 app.post('/api/products/:id/alternative-skus', authenticate, requireRole(...invProductRoles), inventoryController.addAlternativeSku);
 
+// Product Pool (Unmatched SKUs from ShipStation / Channels)
+const productPoolController = require('./controllers/productPoolController');
+app.get('/api/products/pool', authenticate, requireRole(...dashboardRoles), productPoolController.list);
+app.post('/api/products/pool/scan', authenticate, requireRole(...invProductRoles), productPoolController.scan);
+app.post('/api/products/pool/:id/match-alternative', authenticate, requireRole(...invProductRoles), productPoolController.matchAlternative);
+app.post('/api/products/pool/:id/match-bundle', authenticate, requireRole(...invProductRoles), productPoolController.matchBundle);
+app.post('/api/products/pool/:id/create-product', authenticate, requireRole(...invProductRoles), productPoolController.createProduct);
+app.post('/api/products/pool/:id/ignore', authenticate, requireRole(...invProductRoles), productPoolController.ignore);
+app.delete('/api/products/pool/:id', authenticate, requireRole(...invProductRoles), productPoolController.remove);
+
 const returnRoutes = require('./routes/returnRoutes');
 app.use('/api/returns', returnRoutes);
 
 const customDataRoutes = require('./routes/customDataRoutes');
 app.use('/api/custom-data', customDataRoutes);
-
-app.get('/api/test-debug', async (req, res) => {
-  try {
-    const [columns] = await sequelize.query("DESCRIBE order_items");
-    res.json({
-      success: true,
-      columns
-    });
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message,
-      stack: err.stack
-    });
-  }
-});
 
 app.use(routes);
 
@@ -895,6 +889,38 @@ async function start() {
       // console.warn('[SEED] CustomizationMapping seed error:', e.message);
     }
 
+    // Ensure columns, clean UNMATCHED-POOL / undefined placeholders, and enrich ProductPool with ShipStation metadata
+    try {
+      await sequelize.query("ALTER TABLE order_items MODIFY COLUMN product_id INT NULL").catch(() => {});
+      await sequelize.query("ALTER TABLE order_items ADD COLUMN name VARCHAR(255) NULL").catch(() => {});
+      await sequelize.query("ALTER TABLE product_pool ADD COLUMN barcode VARCHAR(255) NULL").catch(() => {});
+      await sequelize.query("ALTER TABLE product_pool ADD COLUMN weight VARCHAR(100) NULL").catch(() => {});
+      await sequelize.query("ALTER TABLE product_pool ADD COLUMN cost_price DECIMAL(12,2) DEFAULT 0.00").catch(() => {});
+      await sequelize.query("ALTER TABLE product_pool ADD COLUMN raw_details LONGTEXT NULL").catch(() => {});
+
+      const { Product, ProductPool } = require('./models');
+      await Product.destroy({ where: { sku: 'UNMATCHED-POOL' } }).catch(() => {});
+      await sequelize.query(`
+        DELETE FROM product_pool 
+        WHERE LOWER(TRIM(sku)) IN ('undefined', 'null', '', 'unmatched-pool') 
+           OR sku IS NULL 
+           OR LOWER(TRIM(name)) LIKE '%undefined%'
+           OR LOWER(TRIM(name)) = 'unmatched sku (undefined)'
+      `).catch(() => {});
+
+      const { scanUnmatchedOrders } = require('./controllers/productPoolController');
+      const shipstationService = require('./modules/integrations/shipstation.service');
+      scanUnmatchedOrders(1).then(async (cnt) => {
+        if (cnt > 0) console.log(`[Product Pool Init] Auto-scanned and populated ${cnt} unmatched SKU(s) into Product Pool.`);
+        try {
+          const eCnt = await shipstationService.enrichPoolFromShipStation(1);
+          if (eCnt > 0) console.log(`[Product Pool Init] Enriched ${eCnt} product name(s) and details from ShipStation V2.`);
+        } catch (eErr) {
+          console.warn('[Product Pool Init Enrichment Warning]:', eErr.message);
+        }
+      }).catch(err => console.warn('[Product Pool Init Warning]:', err.message));
+    } catch (_) {}
+
     // Initialize Cron AFTER database sync is complete
     cronService.init();
 
@@ -907,7 +933,7 @@ async function start() {
       if (err.code === 'EADDRINUSE') {
         console.warn(`[PORT NOTICE] Port ${PORT} is occupied by an existing process. Retrying in 1.5s...`);
         setTimeout(() => {
-          try { server.close(); } catch (_) {}
+          try { server.close(); } catch (_) { }
           start();
         }, 1500);
       } else {
