@@ -43,6 +43,8 @@ router.delete('/customers/:id', requireRole('super_admin', 'company_admin'), cus
 // Courier mappings CRUD and available services
 router.get('/courier-mappings', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), courierMappingController.list);
 router.get('/courier-mappings/available-services', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), courierMappingController.getAvailableServices);
+router.get('/courier-mappings/unmapped-services', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), courierMappingController.getUnmappedServices);
+router.post('/courier-mappings/apply-to-orders', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), courierMappingController.applyToOrders);
 router.post('/courier-mappings', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), courierMappingController.create);
 router.put('/courier-mappings/:id', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), courierMappingController.update);
 router.delete('/courier-mappings/:id', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), courierMappingController.remove);

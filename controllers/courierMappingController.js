@@ -37,7 +37,17 @@ async function create(req, res, next) {
       courierService
     });
 
-    res.json({ success: true, data: mapping });
+    // Auto-apply this new mapping to matching existing open orders
+    let updatedOrdersCount = 0;
+    try {
+      const { applyCourierMappingsToOrders } = require('../services/orderService');
+      const resApply = await applyCourierMappingsToOrders(companyId, mapping);
+      updatedOrdersCount = resApply?.count || 0;
+    } catch (e) {
+      console.warn('[Auto-apply courier mapping warning]:', e.message);
+    }
+
+    res.json({ success: true, data: mapping, ordersUpdated: updatedOrdersCount });
   } catch (err) {
     next(err);
   }
@@ -75,7 +85,18 @@ async function update(req, res, next) {
     if (courierService) mapping.courierService = courierService;
 
     await mapping.save();
-    res.json({ success: true, data: mapping });
+
+    // Auto-apply updated mapping to matching open orders
+    let updatedOrdersCount = 0;
+    try {
+      const { applyCourierMappingsToOrders } = require('../services/orderService');
+      const resApply = await applyCourierMappingsToOrders(companyId, mapping);
+      updatedOrdersCount = resApply?.count || 0;
+    } catch (e) {
+      console.warn('[Auto-apply courier mapping warning]:', e.message);
+    }
+
+    res.json({ success: true, data: mapping, ordersUpdated: updatedOrdersCount });
   } catch (err) {
     next(err);
   }
@@ -95,6 +116,76 @@ async function remove(req, res, next) {
 
     await mapping.destroy();
     res.json({ success: true, message: 'Courier mapping deleted successfully' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function applyToOrders(req, res, next) {
+  try {
+    const companyId = req.user.companyId;
+    const { applyCourierMappingsToOrders } = require('../services/orderService');
+    const result = await applyCourierMappingsToOrders(companyId);
+    res.json({ success: true, count: result.count, message: `Successfully applied courier mappings to ${result.count} order(s)!` });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getUnmappedServices(req, res, next) {
+  try {
+    const companyId = req.user.companyId || 1;
+    const { SalesOrder, CourierMapping } = require('../models');
+    const { Op } = require('sequelize');
+
+    const [orders, mappings] = await Promise.all([
+      SalesOrder.findAll({
+        where: {
+          [Op.or]: [
+            { companyId },
+            { companyId: 1 },
+            { companyId: null }
+          ],
+          status: { [Op.notIn]: ['CANCELLED'] }
+        },
+        attributes: ['requestedShippingService', 'courierService', 'courierName']
+      }),
+      CourierMapping.findAll({
+        where: {
+          [Op.or]: [
+            { companyId },
+            { companyId: 1 },
+            { companyId: null }
+          ]
+        },
+        attributes: ['requestedService']
+      })
+    ]);
+
+    const mappedSet = new Set(mappings.map(m => (m.requestedService || '').toLowerCase().trim()));
+
+    const serviceMap = {};
+    for (const o of orders) {
+      const s1 = (o.requestedShippingService || '').trim();
+      const s2 = (o.courierService || '').trim();
+      const carrier = (o.courierName || '').trim();
+
+      const candidates = [s1, s2].filter(Boolean);
+      for (const s of candidates) {
+        if (!serviceMap[s]) {
+          serviceMap[s] = {
+            name: s,
+            orderCount: 0,
+            carrier: carrier || 'SHIPSTATION',
+            isMapped: mappedSet.has(s.toLowerCase().trim())
+          };
+        }
+        serviceMap[s].orderCount += 1;
+      }
+    }
+
+    const list = Object.values(serviceMap).sort((a, b) => b.orderCount - a.orderCount);
+    res.json({ success: true, data: list });
   } catch (err) {
     next(err);
   }
@@ -152,4 +243,4 @@ async function getAvailableServices(req, res, next) {
   }
 }
 
-module.exports = { list, create, update, remove, getAvailableServices };
+module.exports = { list, create, update, remove, getAvailableServices, applyToOrders, getUnmappedServices };

@@ -41,6 +41,7 @@ const DespatchNoteTemplate = require('./DespatchNoteTemplate');
 const IntegrationConfig = require('./IntegrationConfig');
 const IntegrationLog = require('./IntegrationLog');
 const CustomizationMapping = require('./CustomizationMapping');
+const CustomSkuRule = require('./CustomSkuRule');
 const EndCustomer = require('./EndCustomer');
 const ProductPool = require('./ProductPool');
 
@@ -310,6 +311,7 @@ ProductPool.belongsTo(Bundle, { foreignKey: 'resolvedBundleId', as: 'ResolvedBun
 
 // Ensure ProductPool table exists
 ProductPool.sync().catch(err => console.warn('[ProductPool Sync Notice]:', err.message));
+Bundle.sync({ alter: true }).catch(err => console.warn('[Bundle Sync Notice]:', err.message));
 
 module.exports = {
   sequelize,
@@ -355,6 +357,7 @@ module.exports = {
   IntegrationConfig,
   IntegrationLog,
   CustomizationMapping,
+  CustomSkuRule,
   EndCustomer,
   ProductPool,
 };

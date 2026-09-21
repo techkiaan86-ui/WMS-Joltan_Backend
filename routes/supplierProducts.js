@@ -17,6 +17,8 @@ const readRoles = [...writeRoles, 'viewer'];
 router.get('/', requireRole(...readRoles), supplierProductController.list);
 router.get('/:supplierId/products', requireRole(...readRoles), supplierProductController.listMappedProductsBySupplier);
 router.post('/bulk-upload', requireRole(...writeRoles), upload.single('file'), supplierProductController.bulkUpload);
+router.post('/bulk-delete', requireRole(...writeRoles), supplierProductController.bulkDelete);
 router.delete('/:id', requireRole(...writeRoles), supplierProductController.remove);
 
 module.exports = router;
+

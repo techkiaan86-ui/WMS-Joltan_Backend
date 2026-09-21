@@ -39,6 +39,12 @@ const CustomizationMapping = sequelize.define('CustomizationMapping', {
   costPrice: {
     type: DataTypes.DECIMAL(10, 2),
     allowNull: true
+  },
+  expectedCount: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    defaultValue: null,
+    field: 'expected_count'
   }
 }, {
   tableName: 'customization_mappings',

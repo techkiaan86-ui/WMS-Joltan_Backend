@@ -72,12 +72,18 @@ async function list(reqUser, query = {}) {
       });
     } else if (ch === 'AMAZON') {
       andConditions.push({
-        [Op.or]: [
-          { salesChannel: { [Op.like]: '%AMAZON%' } },
-          { marketplace: { [Op.like]: '%AMAZON%' } },
-          { orderNumber: { [Op.like]: 'AMZ%' } },
-          { orderNumber: { [Op.regexp]: '^[0-9]{3}-[0-9]{7}-[0-9]{7}$' } },
-          { email: { [Op.like]: '%@marketplace.amazon%' } }
+        [Op.and]: [
+          {
+            [Op.or]: [
+              { salesChannel: { [Op.like]: '%AMAZON%' } },
+              { marketplace: { [Op.like]: '%AMAZON%' } },
+              { orderNumber: { [Op.like]: 'AMZ%' } },
+              { orderNumber: { [Op.regexp]: '^[0-9]{3}-[0-9]{7}-[0-9]{7}$' } },
+              { email: { [Op.like]: '%@marketplace.amazon%' } }
+            ]
+          },
+          { orderNumber: { [Op.notLike]: 'PO%' } },
+          { orderNumber: { [Op.notLike]: 'F%' } }
         ]
       });
     } else if (ch === 'SHOPIFY') {
@@ -88,17 +94,21 @@ async function list(reqUser, query = {}) {
               { salesChannel: { [Op.like]: '%SHOPIFY%' } },
               { marketplace: { [Op.like]: '%SHOPIFY%' } },
               { orderNumber: { [Op.like]: 'SHPF%' } },
-              { orderNumber: { [Op.like]: 'SHOPIFY%' } }
+              { orderNumber: { [Op.like]: 'SHOPIFY%' } },
+              { orderNumber: { [Op.like]: 'F%' } }
             ]
           },
-          { salesChannel: { [Op.notLike]: '%WHOLESALE%' } }
+          { salesChannel: { [Op.notLike]: '%WHOLESALE%' } },
+          { marketplace: { [Op.notLike]: '%WHOLESALE%' } },
+          { orderNumber: { [Op.notLike]: 'FW%' } }
         ]
       });
     } else if (ch === 'SHOPIFY_WHOLESALE') {
       andConditions.push({
         [Op.or]: [
           { salesChannel: { [Op.like]: '%WHOLESALE%' } },
-          { marketplace: { [Op.like]: '%WHOLESALE%' } }
+          { marketplace: { [Op.like]: '%WHOLESALE%' } },
+          { orderNumber: { [Op.like]: 'FW%' } }
         ]
       });
     } else if (ch === 'EBAY') {
@@ -125,7 +135,8 @@ async function list(reqUser, query = {}) {
         [Op.or]: [
           { salesChannel: { [Op.like]: '%TEMU%' } },
           { marketplace: { [Op.like]: '%TEMU%' } },
-          { orderNumber: { [Op.like]: 'TEMU%' } }
+          { orderNumber: { [Op.like]: 'TEMU%' } },
+          { orderNumber: { [Op.like]: 'PO%' } }
         ]
       });
     } else if (ch === 'TIKTOK') {
@@ -440,20 +451,90 @@ async function getById(id, reqUser) {
 }
 
 async function resolveCourierMapping(data, companyId, transaction = null) {
-  if (data.requestedShippingService && data.requestedShippingService.trim()) {
-    const serviceName = data.requestedShippingService.trim();
-    const mapping = await CourierMapping.findOne({
-      where: {
-        companyId,
-        requestedService: serviceName
-      },
-      transaction
+  const compId = companyId || 1;
+  const rawService = (data.requestedShippingService || data.courierService || '').trim();
+  if (!rawService) return;
+
+  const mappings = await CourierMapping.findAll({
+    where: {
+      [Op.or]: [
+        { companyId: compId },
+        { companyId: null },
+        { companyId: 1 }
+      ]
+    },
+    transaction
+  });
+
+  if (!mappings || mappings.length === 0) return;
+
+  const cleanRaw = rawService.toLowerCase().trim();
+  const matched = mappings.find(m => {
+    const req = (m.requestedService || '').toLowerCase().trim();
+    return req && req === cleanRaw;
+  });
+
+  if (matched) {
+    if (!data.requestedShippingService) {
+      data.requestedShippingService = rawService;
+    }
+    data.courierName = matched.courierName;
+    data.courierService = matched.courierService;
+  }
+}
+
+async function applyCourierMappingsToOrders(companyId, specificMapping = null) {
+  const compId = companyId || 1;
+  const mappings = specificMapping
+    ? [specificMapping]
+    : await CourierMapping.findAll({
+        where: {
+          [Op.or]: [
+            { companyId: compId },
+            { companyId: 1 },
+            { companyId: null }
+          ]
+        }
+      });
+
+  if (!mappings || mappings.length === 0) return { count: 0 };
+
+  const orders = await SalesOrder.findAll({
+    where: {
+      companyId: compId,
+      status: { [Op.notIn]: ['CANCELLED', 'DISPATCHED', 'DELIVERED', 'SHIPPED'] }
+    }
+  });
+
+  let updatedCount = 0;
+  for (const order of orders) {
+    const rawReq = (order.requestedShippingService || '').trim();
+    const rawServ = (order.courierService || '').trim();
+    const cleanReq = rawReq.toLowerCase();
+    const cleanServ = rawServ.toLowerCase();
+
+    const matched = mappings.find(m => {
+      const target = (m.requestedService || '').toLowerCase().trim();
+      return target && (target === cleanReq || target === cleanServ);
     });
-    if (mapping) {
-      data.courierName = mapping.courierName;
-      data.courierService = mapping.courierService;
+
+    if (matched) {
+      const needsUpdate = order.courierName !== matched.courierName ||
+        order.courierService !== matched.courierService ||
+        !order.requestedShippingService;
+
+      if (needsUpdate) {
+        await order.update({
+          courierName: matched.courierName,
+          courierService: matched.courierService,
+          requestedShippingService: order.requestedShippingService || rawServ || matched.requestedService
+        });
+        updatedCount++;
+      }
     }
   }
+
+  return { count: updatedCount };
 }
 
 async function create(data, reqUser) {
@@ -802,6 +883,9 @@ async function update(id, data, reqUser) {
         }
       }
     }
+
+    // 2. Resolve Courier Mapping if applicable
+    await resolveCourierMapping(data, order.companyId, t);
 
     // 2. Update Order Details
     await order.update({
@@ -2193,29 +2277,46 @@ async function updateNotes(id, data, reqUser) {
 (async () => {
   try {
     const { sequelize } = require('../config/db');
-    // 1. Shopify backfill (Every SHPF- order is 100% Shopify)
+    // 1. Temu backfill (PO- or TEMU-)
+    await sequelize.query(`
+      UPDATE sales_orders 
+      SET sales_channel = 'ShipStation (Temu)', marketplace = 'Temu' 
+      WHERE order_number LIKE 'PO%' OR order_number LIKE 'TEMU%';
+    `);
+    // 2. Shopify Wholesale backfill (FW-)
+    await sequelize.query(`
+      UPDATE sales_orders 
+      SET sales_channel = 'ShipStation (Shopify Wholesale)', marketplace = 'Shopify Wholesale' 
+      WHERE order_number LIKE 'FW%';
+    `);
+    // 3. Shopify Retail backfill (F- or SHPF- or SHOPIFY-)
     await sequelize.query(`
       UPDATE sales_orders 
       SET sales_channel = 'ShipStation (Shopify)', marketplace = 'Shopify' 
-      WHERE order_number LIKE 'SHPF-%' OR order_number LIKE 'SHOPIFY-%';
+      WHERE (order_number LIKE 'F%' OR order_number LIKE 'SHPF%' OR order_number LIKE 'SHOPIFY%')
+        AND order_number NOT LIKE 'FW%';
     `);
-    // 2. Amazon backfill (Amazon order ID pattern or Amazon email)
+    // 4. Amazon backfill (Amazon order ID pattern or Amazon email)
     await sequelize.query(`
       UPDATE sales_orders 
       SET sales_channel = 'ShipStation (Amazon)', marketplace = 'Amazon' 
       WHERE (order_number REGEXP '^[0-9]{3}-[0-9]{7}-[0-9]{7}$' OR email LIKE '%@marketplace.amazon%' OR email LIKE '%@m.amazon%')
-        AND order_number NOT LIKE 'SHPF-%';
+        AND order_number NOT LIKE 'SHPF-%'
+        AND order_number NOT LIKE 'F%'
+        AND order_number NOT LIKE 'PO%';
     `);
-    // 3. eBay backfill
+    // 5. eBay backfill
     await sequelize.query(`
       UPDATE sales_orders 
       SET sales_channel = 'ShipStation (eBay)', marketplace = 'eBay' 
       WHERE (order_number LIKE 'EBAY-%' OR email LIKE '%@members.ebay%')
-        AND order_number NOT LIKE 'SHPF-%';
+        AND order_number NOT LIKE 'SHPF-%'
+        AND order_number NOT LIKE 'F%'
+        AND order_number NOT LIKE 'PO%';
     `);
   } catch (e) {
     // Ignore migration warning
   }
 })();
 
-module.exports = { list, getById, create, update, updateNotes, remove, bulkAction, allocateAllOrders, importCsv, generateDespatchNotePdf, syncReservations, syncReservationsForProduct, markAsPrinted };
+module.exports = { list, getById, create, update, updateNotes, remove, bulkAction, allocateAllOrders, importCsv, generateDespatchNotePdf, syncReservations, syncReservationsForProduct, markAsPrinted, resolveCourierMapping, applyCourierMappingsToOrders };

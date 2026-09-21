@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { SalesOrder, OrderItem, Product, ProductStock, IntegrationConfig, Customer, Warehouse, Zone, Location, Category, Inventory, Shipment, Bundle, ProductPool } = require('../../models');
+const { SalesOrder, OrderItem, Product, ProductStock, IntegrationConfig, Customer, Warehouse, Zone, Location, Category, Inventory, Shipment, Bundle, ProductPool, CustomizationMapping, CourierMapping } = require('../../models');
 
 const SHIPSTATION_V2_BASE_URL = process.env.SHIPSTATION_API_URL || 'https://api.shipstation.com/v2';
 
@@ -1057,6 +1057,22 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
       // Ignore
     }
 
+    // Pre-fetch all active Courier Mappings for this company to map shipping services dynamically
+    let courierMappings = [];
+    try {
+      courierMappings = await CourierMapping.findAll({
+        where: {
+          [Op.or]: [
+            { companyId: companyId || 1 },
+            { companyId: 1 },
+            { companyId: null }
+          ]
+        }
+      });
+    } catch (cmErr) {
+      console.warn('[ShipStation Courier Mappings Load Warning]:', cmErr.message);
+    }
+
     for (const ssOrder of orders) {
       // Date Window Enforcement: Strictly ensure order date is within [startDate, endDate]
       const rawDate = ssOrder.orderDate || ssOrder.order_date || ssOrder.create_date || ssOrder.created_at || ssOrder.ship_date;
@@ -1094,12 +1110,18 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
         } else if (typeof storeEntry === 'string') {
           detectedPlatform = storeEntry;
         }
-      } else if (storeName.includes('AMAZON') || customerEmail.includes('@marketplace.amazon') || customerEmail.includes('@m.amazon') || /^\d{3}-\d{7}-\d{7}$/.test(orderNumStr)) {
+      } else if (orderNumStr.startsWith('PO') || orderNumStr.startsWith('TEMU')) {
+        detectedPlatform = 'Temu';
+      } else if (orderNumStr.startsWith('FW')) {
+        detectedPlatform = 'Shopify Wholesale';
+      } else if (orderNumStr.startsWith('F') || orderNumStr.startsWith('SHPF') || orderNumStr.startsWith('SHOPIFY')) {
+        detectedPlatform = 'Shopify';
+      } else if (orderNumStr.startsWith('EBAY') || storeName.includes('EBAY') || customerEmail.includes('@members.ebay') || customerEmail.includes('@ebay')) {
+        detectedPlatform = 'eBay';
+      } else if (orderNumStr.startsWith('AMZ') || /^\d{3}-\d{7}-\d{7}$/.test(orderNumStr) || storeName.includes('AMAZON') || customerEmail.includes('@marketplace.amazon') || customerEmail.includes('@m.amazon')) {
         detectedPlatform = 'Amazon';
       } else if (storeName.includes('SHOPIFY') || customerEmail.includes('@shopify') || customerEmail.includes('@myshopify')) {
         detectedPlatform = storeName.includes('WHOLESALE') ? 'Shopify Wholesale' : 'Shopify';
-      } else if (storeName.includes('EBAY') || customerEmail.includes('@members.ebay') || customerEmail.includes('@ebay')) {
-        detectedPlatform = 'eBay';
       } else if (storeName.includes('WALMART') || customerEmail.includes('@walmart')) {
         detectedPlatform = 'Walmart';
       } else if (storeName.includes('TEMU')) {
@@ -1115,9 +1137,25 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
 
       // Shipping address & requested courier details
       const shipTo = ssOrder.shipTo || ssOrder.ship_to || ssOrder.shippingAddress || ssOrder.shipping_address || {};
-      const courierService = ssOrder.requested_shipment_service || ssOrder.requestedShippingService || ssOrder.serviceCode || ssOrder.service_code || ssOrder.carrierCode || ssOrder.carrier_code || 'Standard Courier';
+      const rawService = ssOrder.requested_shipment_service || ssOrder.requestedShippingService || ssOrder.serviceCode || ssOrder.service_code || ssOrder.carrierCode || ssOrder.carrier_code || 'Standard Courier';
       const rawCarrier = ssOrder.carrierCode || ssOrder.carrier_code || ssOrder.carrier_id || '';
-      const courierName = rawCarrier ? String(rawCarrier).replace(/_/g, ' ').toUpperCase() : 'SHIPSTATION';
+      const defaultCourierName = rawCarrier ? String(rawCarrier).replace(/_/g, ' ').toUpperCase() : 'SHIPSTATION';
+
+      let courierName = defaultCourierName;
+      let courierService = rawService;
+      const requestedShippingService = rawService;
+
+      if (courierMappings && courierMappings.length > 0) {
+        const cleanReq = String(rawService || '').toLowerCase().trim();
+        const matched = courierMappings.find(m => {
+          const target = String(m.requestedService || '').toLowerCase().trim();
+          return target && target === cleanReq;
+        });
+        if (matched) {
+          courierName = matched.courierName;
+          courierService = matched.courierService;
+        }
+      }
 
       const recipientName = shipTo.name || shipTo.full_name || ssOrder.customer_name || ssOrder.customerName || ssOrder.customerUsername || ssOrder.customer_username || (shipTo.first_name ? `${shipTo.first_name} ${shipTo.last_name || ''}`.trim() : null) || 'Customer';
       const addressLine1 = shipTo.address_line1 || shipTo.street1 || shipTo.address1 || shipTo.street_1 || '';
@@ -1208,6 +1246,21 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
         if (!existingOrder.customField2 && customField2) updates.customField2 = customField2;
         if (!existingOrder.customField3 && customField3) updates.customField3 = customField3;
         if (!existingOrder.externalRef && customField1) updates.externalRef = customField1;
+        if (!existingOrder.requestedShippingService && requestedShippingService) updates.requestedShippingService = requestedShippingService;
+        if (courierMappings && courierMappings.length > 0) {
+          const currentReq = String(existingOrder.requestedShippingService || existingOrder.courierService || rawService || '').toLowerCase().trim();
+          const matched = courierMappings.find(m => {
+            const target = String(m.requestedService || '').toLowerCase().trim();
+            return target && target === currentReq;
+          });
+          if (matched && (existingOrder.courierName !== matched.courierName || existingOrder.courierService !== matched.courierService)) {
+            if (!['DISPATCHED', 'SHIPPED', 'DELIVERED', 'CANCELLED'].includes(String(existingOrder.status).toUpperCase())) {
+              updates.courierName = matched.courierName;
+              updates.courierService = matched.courierService;
+              if (!updates.requestedShippingService) updates.requestedShippingService = existingOrder.requestedShippingService || rawService;
+            }
+          }
+        }
         if (Object.keys(updates).length > 0) {
           await existingOrder.update(updates);
         }
@@ -1260,6 +1313,7 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
           salesChannel,
           courierName,
           courierService,
+          requestedShippingService,
           recipientName,
           addressLine1,
           addressLine2,
@@ -1329,7 +1383,16 @@ async function syncOrdersFromShipStation(companyId, options = {}) {
               hasBundle = true;
             }
 
-            const isCustomParentSku = (sku && ['SF_3', 'NA_M_12'].includes(sku)) || !!customUrl;
+            let isCustomParentSku = !!customUrl;
+            if (!isCustomParentSku && sku) {
+              const customMap = await CustomizationMapping.findOne({
+                where: {
+                  companyId: companyId || 1,
+                  originalSku: String(sku).trim()
+                }
+              }).catch(() => null);
+              if (customMap) isCustomParentSku = true;
+            }
 
             const finalImg = productImageUrl || (product && !product.isBundleRecord ? firstProductImage(product.images) : null);
 

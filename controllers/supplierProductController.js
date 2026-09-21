@@ -442,4 +442,24 @@ async function remove(req, res, next) {
   }
 }
 
-module.exports = { list, listMappedProductsBySupplier, bulkUpload, remove };
+async function bulkDelete(req, res, next) {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, message: 'No mapping IDs provided for deletion' });
+    }
+    const { SupplierProduct } = require('../models');
+    const { Op } = require('sequelize');
+    const where = { id: { [Op.in]: ids } };
+    if (req.user && req.user.companyId && req.user.role !== 'super_admin') {
+      where.companyId = req.user.companyId;
+    }
+    const count = await SupplierProduct.destroy({ where });
+    res.json({ success: true, message: `Successfully deleted ${count} mapping(s)`, count });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { list, listMappedProductsBySupplier, bulkUpload, remove, bulkDelete };
+

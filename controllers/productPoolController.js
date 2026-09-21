@@ -401,10 +401,15 @@ async function list(req, res, next) {
 async function matchAlternative(req, res, next) {
   try {
     const { id } = req.params;
-    const { targetProductId, notes } = req.body;
+    const { targetProductId, actionType, notes } = req.body;
+
+    // If user chose to create a new product from the match modal
+    if (actionType === 'CREATE_NEW' || (!targetProductId && (req.body.name || req.body.newProductName))) {
+      return createProduct(req, res, next);
+    }
 
     if (!targetProductId) {
-      return res.status(400).json({ success: false, message: 'Target product ID is required' });
+      return res.status(400).json({ success: false, message: 'Target product ID is required to match as an Alternative SKU' });
     }
 
     const poolItem = await ProductPool.findByPk(id);

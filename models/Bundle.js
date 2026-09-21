@@ -10,6 +10,7 @@ const Bundle = sequelize.define('Bundle', {
   costPrice: { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
   sellingPrice: { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
   status: { type: DataTypes.STRING, defaultValue: 'ACTIVE' },
+  images: { type: DataTypes.JSON, allowNull: true },
 }, {
   tableName: 'bundles',
   timestamps: true,

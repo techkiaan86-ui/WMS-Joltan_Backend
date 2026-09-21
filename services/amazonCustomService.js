@@ -1,6 +1,6 @@
 const axios = require('axios');
 const zlib = require('zlib');
-const { CustomizationMapping, SalesOrder, OrderItem, Product, ProductPool } = require('../models');
+const { CustomizationMapping, CustomSkuRule, SalesOrder, OrderItem, Product, ProductPool } = require('../models');
 const { Op } = require('sequelize');
 
 /**
@@ -365,57 +365,171 @@ async function processOrderCustomizations(salesOrderIdOrOrder, preloadedMappings
     }
 
     if (matches && matches.length > 0) {
-      const firstMatch = matches[0];
-      const newSku = firstMatch.processedSku;
+      const validMatches = matches.filter(m => m && m.processedSku && m.processedSku !== 'DISP_No_thx');
+      if (validMatches.length === 0) continue;
 
-      if (!newSku || newSku === 'DISP_No_thx' || newSku === rawSku) continue;
-
-      // 1. Find or create the target Product with the actual SKU
-      let targetProduct = await Product.findOne({ where: { sku: newSku, companyId: compId } });
-      if (!targetProduct) {
-        targetProduct = await Product.findOne({ where: { sku: newSku } });
-      }
-      if (!targetProduct) {
-        try {
-          targetProduct = await Product.create({
-            companyId: compId,
-            name: `${newSku} (Custom Product)`,
-            sku: newSku,
-            barcode: newSku,
-            price: item.unitPrice || 0,
-            status: 'ACTIVE',
-            productType: 'SINGLE',
-            description: `Extracted from Amazon Customization for Order #${order.orderNumber}`
-          });
-        } catch (pErr) {
-          // Ignore if created concurrently
+      // 1. Check expected count rule for parent SKU
+      let expectedCount = null;
+      try {
+        if (allMappings && rawSku) {
+          const mapWithCount = allMappings.find(m => 
+            String(m.originalSku || '').trim().toLowerCase() === rawSku.toLowerCase() &&
+            m.expectedCount != null
+          );
+          if (mapWithCount) {
+            expectedCount = mapWithCount.expectedCount;
+          }
         }
-      }
+        if (!expectedCount) {
+          let rule = await CustomSkuRule.findOne({ where: { companyId: compId, sku: rawSku } });
+          if (!rule && rawSku) {
+            rule = await CustomSkuRule.findOne({
+              where: {
+                companyId: compId,
+                sku: { [Op.like]: rawSku }
+              }
+            });
+          }
+          if (rule) {
+            expectedCount = rule.expectedCount;
+          } else {
+            const numMatch = rawSku.match(/_(\d+)$/);
+            if (numMatch) {
+              expectedCount = parseInt(numMatch[1], 10);
+            }
+          }
+        }
+      } catch (rErr) {}
 
-      // 2. Update OrderItem with actual product SKU
+      const orderQty = Math.max(1, parseInt(item.quantity || 1, 10));
+      const totalExpected = expectedCount ? expectedCount * orderQty : null;
+
+      // Determine quantity per matched item:
+      // If customer selected 4 options for a 4-pack but ordered 2 packs (qty=2), each item gets qty=2.
+      let perMatchQty = 1;
+      if (expectedCount && validMatches.length === expectedCount && orderQty > 1) {
+        perMatchQty = orderQty;
+      }
+      const actualExtractedCount = validMatches.length * perMatchQty;
+
+      // 2. Helper to find or create product for extracted SKU
+      const getOrCreateProduct = async (pSku, optVal) => {
+        let p = await Product.findOne({ where: { sku: pSku, companyId: compId } });
+        if (!p) p = await Product.findOne({ where: { sku: pSku } });
+        if (!p) {
+          try {
+            p = await Product.create({
+              companyId: compId,
+              name: optVal ? `${pSku} (${optVal})` : `${pSku} (Custom Product)`,
+              sku: pSku,
+              barcode: pSku,
+              price: item.unitPrice || 0,
+              status: 'ACTIVE',
+              productType: 'SINGLE',
+              description: `Extracted from Amazon Customization for Order #${order.orderNumber}`
+            });
+          } catch (_) {}
+        }
+        return p;
+      };
+
+      // 3. Update the first OrderItem to the 1st matched SKU (preserving rawSku as originalSku!)
+      const firstMatch = validMatches[0];
+      const p0 = await getOrCreateProduct(firstMatch.processedSku, firstMatch.optionValue);
       await item.update({
-        originalSku: newSku, // Now updated to actual SKU!
+        originalSku: rawSku, // PRESERVE parent SKU (e.g. SF_4, EK_12) as originalSku!
+        productId: p0 ? p0.id : item.productId,
+        quantity: perMatchQty,
+        batchNumber: firstMatch.optionValue || item.batchNumber,
         customizedUrl: customUrl || item.customizedUrl,
-        productId: targetProduct ? targetProduct.id : item.productId,
-        batchNumber: firstMatch.optionValue || item.batchNumber
+        name: p0 ? p0.name : item.name
       });
 
-      // 3. Remove raw parent SKU (e.g. SF_3, NA_M_12) from ProductPool
-      ProductPool.destroy({
-        where: {
-          sku: [rawSku, 'SF_3', 'NA_M_12'].filter(Boolean),
-          companyId: compId
-        }
-      }).catch(() => {});
+      // 4. Create sibling OrderItems for remaining matches (matches 2..N) if not already present
+      if (validMatches.length > 1) {
+        const existingSiblings = await OrderItem.findAll({
+          where: {
+            salesOrderId: order.id,
+            originalSku: rawSku,
+            id: { [Op.ne]: item.id }
+          }
+        });
 
-      // 4. Update order internal notes: remove unmatched SKU warning
-      if (order.internalNotes && order.internalNotes.includes(`Unmatched SKU "${rawSku}"`)) {
-        try {
-          const cleanedNotes = order.internalNotes
-            .replace(new RegExp(`\\[WARNING: Unmatched SKU "${rawSku}"[^\\]]*\\]\\s*\\|?\\s*`, 'g'), '')
-            .trim();
-          order.update({ internalNotes: cleanedNotes }).catch(() => {});
-        } catch (noteErr) {}
+        if (existingSiblings.length === 0) {
+          for (let mIdx = 1; mIdx < validMatches.length; mIdx++) {
+            const m = validMatches[mIdx];
+            const pm = await getOrCreateProduct(m.processedSku, m.optionValue);
+            await OrderItem.create({
+              salesOrderId: order.id,
+              productId: pm ? pm.id : null,
+              quantity: perMatchQty,
+              unitPrice: 0,
+              netPrice: 0,
+              grossPrice: 0,
+              vatRate: 0,
+              vatAmount: 0,
+              warehouseId: item.warehouseId,
+              locationId: item.locationId,
+              batchNumber: m.optionValue || null,
+              originalSku: rawSku,
+              customizedUrl: customUrl || item.customizedUrl,
+              name: pm ? pm.name : `${m.processedSku} (Custom Product)`
+            });
+          }
+        }
+      }
+
+      // 5. Add original parent SKU as a TAG to the order so it can be filtered
+      if (rawSku) {
+        const currentTags = (order.tags || '')
+          .split(',')
+          .map(t => t.trim())
+          .filter(Boolean);
+        if (!currentTags.includes(rawSku)) {
+          currentTags.push(rawSku);
+          const updatedTags = currentTags.join(', ');
+          await order.update({ tags: updatedTags }).catch(() => {});
+          order.tags = updatedTags;
+        }
+      }
+
+      // 6. Check for expected count mismatch and record warning on order
+      let currentNotes = order.internalNotes || '';
+      currentNotes = currentNotes
+        .replace(new RegExp(`\\[WARNING: Custom SKU Mismatch: ${rawSku}[^\\]]*\\]\\s*\\|?\\s*`, 'g'), '')
+        .trim();
+
+      if (totalExpected && actualExtractedCount !== totalExpected) {
+        const mismatchWarning = `[WARNING: Custom SKU Mismatch: ${rawSku} expected ${totalExpected} items, got ${actualExtractedCount}]`;
+        currentNotes = currentNotes ? `${mismatchWarning} | ${currentNotes}` : mismatchWarning;
+      }
+
+      // Remove unmatched SKU warning
+      if (currentNotes.includes(`Unmatched SKU "${rawSku}"`)) {
+        currentNotes = currentNotes
+          .replace(new RegExp(`\\[WARNING: Unmatched SKU "${rawSku}"[^\\]]*\\]\\s*\\|?\\s*`, 'g'), '')
+          .trim();
+      }
+
+      await order.update({ internalNotes: currentNotes }).catch(() => {});
+      order.internalNotes = currentNotes;
+
+      // 7. Update totalItems on order
+      try {
+        const totalItemsSum = await OrderItem.sum('quantity', { where: { salesOrderId: order.id } });
+        if (totalItemsSum && totalItemsSum > 0) {
+          await order.update({ totalItems: totalItemsSum });
+        }
+      } catch (_) {}
+
+      // 8. Remove raw parent SKU from ProductPool
+      if (rawSku) {
+        ProductPool.destroy({
+          where: {
+            sku: rawSku,
+            companyId: compId
+          }
+        }).catch(() => {});
       }
 
       updatedCount++;
@@ -426,7 +540,7 @@ async function processOrderCustomizations(salesOrderIdOrOrder, preloadedMappings
 }
 
 /**
- * Process all existing orders that have unextracted parent SKUs (e.g. SF_3, NA_M_12) or customized URLs.
+ * Process all existing orders that have unextracted parent SKUs or customized URLs.
  * High Performance Implementation:
  *   - Preloads CustomizationMapping into memory
  *   - Only queries orders having candidate parent SKUs or customized URLs (skipping hundreds of irrelevant orders)
@@ -449,7 +563,7 @@ async function processAllPendingOrders(companyId) {
   // Auto-heal schema if running before complete server sync
   await ensureCustomizationSchema();
 
-  // 1. Preload all mappings in 1 query
+  // 1. Preload all mappings dynamically from DB
   let allMappings = [];
   try {
     allMappings = await CustomizationMapping.findAll({
@@ -459,29 +573,31 @@ async function processAllPendingOrders(companyId) {
     console.warn('[processAllPendingOrders] CustomizationMapping fetch warning:', mErr.message);
   }
 
+  let customRules = [];
+  try {
+    customRules = await CustomSkuRule.findAll({ where: { companyId: compId } });
+  } catch (_) {}
+  const ruleSkus = customRules.map(r => r.sku).filter(Boolean);
+
   const parentSkuSet = new Set(
     allMappings
       .map(m => m.originalSku)
       .filter(Boolean)
-      .concat(['SF_3', 'NA_M_12'])
+      .concat(ruleSkus)
   );
 
   const targetOrderIdsSet = new Set();
+  const parentSkus = Array.from(parentSkuSet);
 
-  // 2. Find candidate order items that need resolution
+  // 2. Find candidate order items that need resolution dynamically
   try {
-    const parentSkus = Array.from(parentSkuSet);
+    const orConditions = [{ customizedUrl: { [Op.ne]: null } }];
+    if (parentSkus.length > 0) {
+      orConditions.push({ originalSku: { [Op.in]: parentSkus } });
+    }
+
     const candidateItems = await OrderItem.findAll({
-      where: {
-        [Op.or]: [
-          { customizedUrl: { [Op.ne]: null } },
-          { originalSku: { [Op.in]: parentSkus } },
-          { originalSku: { [Op.like]: 'SF_%' } },
-          { originalSku: { [Op.like]: 'NA_%' } },
-          { originalSku: 'SF_3' },
-          { originalSku: 'NA_M_12' }
-        ]
-      },
+      where: { [Op.or]: orConditions },
       attributes: ['salesOrderId'],
       limit: 500
     });
@@ -490,30 +606,30 @@ async function processAllPendingOrders(companyId) {
     console.warn('[processAllPendingOrders] candidateItems query warning:', itemErr.message);
   }
 
-  // Also find items linked to products with parent SKUs (e.g. SF_3, NA_M_12)
+  // Also find items linked to products with parent SKUs dynamically from database
   try {
-    const parentProducts = await Product.findAll({
-      where: {
-        sku: { [Op.in]: ['SF_3', 'NA_M_12', ...Array.from(parentSkuSet)] }
-      },
-      attributes: ['id']
-    });
-
-    if (parentProducts.length > 0) {
-      const pItems = await OrderItem.findAll({
-        where: {
-          productId: { [Op.in]: parentProducts.map(p => p.id) }
-        },
-        attributes: ['salesOrderId'],
-        limit: 500
+    if (parentSkus.length > 0) {
+      const parentProducts = await Product.findAll({
+        where: { sku: { [Op.in]: parentSkus } },
+        attributes: ['id']
       });
-      pItems.forEach(i => i.salesOrderId && targetOrderIdsSet.add(i.salesOrderId));
+
+      if (parentProducts.length > 0) {
+        const pItems = await OrderItem.findAll({
+          where: {
+            productId: { [Op.in]: parentProducts.map(p => p.id) }
+          },
+          attributes: ['salesOrderId'],
+          limit: 500
+        });
+        pItems.forEach(i => i.salesOrderId && targetOrderIdsSet.add(i.salesOrderId));
+      }
     }
   } catch (prodErr) {
     console.warn('[processAllPendingOrders] parentProducts query warning:', prodErr.message);
   }
 
-  // 3. Find candidate orders with warning or customizedURL / links in notes
+  // 3. Find candidate orders with customizedURL / links or warnings in notes dynamically
   try {
     const candidateNoteOrders = await SalesOrder.findAll({
       where: {
@@ -522,10 +638,8 @@ async function processAllPendingOrders(companyId) {
           { notes: { [Op.like]: '%http%' } },
           { internalNotes: { [Op.like]: '%http%' } },
           { notesFromBuyer: { [Op.like]: '%http%' } },
-          { notes: { [Op.like]: '%SF_%' } },
-          { internalNotes: { [Op.like]: '%SF_%' } },
-          { internalNotes: { [Op.like]: '%NA_%' } },
-          { internalNotes: { [Op.like]: '%Unmatched SKU%' } }
+          { internalNotes: { [Op.like]: '%Unmatched SKU%' } },
+          { internalNotes: { [Op.like]: '%Custom SKU Mismatch%' } }
         ]
       },
       attributes: ['id'],
@@ -576,4 +690,3 @@ module.exports = {
   processOrderCustomizations,
   processAllPendingOrders
 };
-

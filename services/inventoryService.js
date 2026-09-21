@@ -335,6 +335,25 @@ async function exportProductsCsv(reqUser, query = {}) {
     const packSize = prod.packSize || 1;
     const supplierCost = rawCost * packSize;
 
+    // Resolve VAT Rate & Code with two-way fallback so export is never half-empty or blank
+    let exportVatRate = (prod.vatRate !== null && prod.vatRate !== undefined && prod.vatRate !== '') ? Number(prod.vatRate) : null;
+    let exportVatCode = prod.vatCode ? String(prod.vatCode).trim().toUpperCase() : '';
+
+    if (!exportVatCode && exportVatRate !== null) {
+      if (exportVatRate === 0) exportVatCode = 'ZERO';
+      else if (exportVatRate === 20) exportVatCode = 'STANDARD';
+      else if (exportVatRate === 5) exportVatCode = 'REDUCED';
+      else exportVatCode = 'STANDARD';
+    } else if (exportVatCode && exportVatRate === null) {
+      if (exportVatCode === 'ZERO' || exportVatCode === 'EXEMPT') exportVatRate = 0;
+      else if (exportVatCode === 'STANDARD') exportVatRate = 20;
+      else if (exportVatCode === 'REDUCED') exportVatRate = 5;
+      else exportVatRate = 20;
+    } else if (!exportVatCode && exportVatRate === null) {
+      exportVatRate = 20;
+      exportVatCode = 'STANDARD';
+    }
+
     // normalizeProductJson calls p.get({ plain: true }) which includes all associations
     const pickingLoc = prod.DefaultPickingLocation;
 
@@ -351,9 +370,9 @@ async function exportProductsCsv(reqUser, query = {}) {
       prod.Supplier?.name || '',
       prod.Client?.name || '',
       prod.unitOfMeasure || 'EACH',
-      prod.vatRate ?? '',
-      prod.vatCode || '',
-      prod.customsTariff || '',
+      exportVatRate != null ? exportVatRate : 20,
+      exportVatCode || 'STANDARD',
+      prod.customsTariff || '1905.90.80',
       prod.heatSensitive || 'no',
       prod.perishable || 'no',
       prod.requireBatchTracking || 'no',
@@ -461,10 +480,24 @@ async function getProductById(id, reqUser) {
     updates.unitOfMeasure = 'Units';
     updated = true;
   }
-  if (!product.vatRate) {
-    updates.vatRate = 20.00;
-    updates.vatCode = 'STANDARD';
+  if (product.vatRate === null || product.vatRate === undefined || product.vatRate === '') {
+    const vc = product.vatCode ? String(product.vatCode).trim().toUpperCase() : '';
+    if (vc === 'ZERO' || vc === 'EXEMPT') {
+      updates.vatRate = 0.00;
+      updates.vatCode = 'ZERO';
+    } else if (vc === 'REDUCED') {
+      updates.vatRate = 5.00;
+      updates.vatCode = 'REDUCED';
+    } else {
+      updates.vatRate = 20.00;
+      updates.vatCode = 'STANDARD';
+    }
     updated = true;
+  } else if (!product.vatCode) {
+    const r = Number(product.vatRate);
+    if (r === 0) { updates.vatCode = 'ZERO'; updated = true; }
+    else if (r === 20) { updates.vatCode = 'STANDARD'; updated = true; }
+    else if (r === 5) { updates.vatCode = 'REDUCED'; updated = true; }
   }
   if (!product.customsTariff) {
     updates.customsTariff = '1905.90.80';
@@ -511,22 +544,13 @@ async function getProductById(id, reqUser) {
     } catch (_) { }
   }
 
-  // Ensure default ProductStock exists so Total Stock & Inventory Tab show stock units
-  if (!product.ProductStocks || product.ProductStocks.length === 0) {
+  // Assign default picking location if missing (without creating any fake stock)
+  if (!product.defaultPickingLocationId) {
     try {
       const warehouse = await Warehouse.findOne({ where: { companyId: product.companyId } });
       if (warehouse) {
         const location = await getOrCreateZoneAndLocation(warehouse.id, product.companyId);
-        await ProductStock.create({
-          companyId: product.companyId,
-          productId: product.id,
-          warehouseId: warehouse.id,
-          locationId: location ? location.id : null,
-          quantity: 100,
-          allocatedQty: 0,
-          status: 'ACTIVE'
-        });
-        if (location && !product.defaultPickingLocationId) {
+        if (location) {
           await product.update({ defaultPickingLocationId: location.id });
         }
       }
@@ -628,6 +652,18 @@ async function createProduct(data, reqUser) {
   // We store costPrice as unit cost in the database
   const unitCost = packSize > 0 ? (rawCost / packSize) : rawCost;
 
+  let finalVatRate = data.vatRate != null && data.vatRate !== '' ? Number(data.vatRate) : null;
+  let finalVatCode = data.vatCode ? String(data.vatCode).trim().toUpperCase() : null;
+  if (!finalVatCode && finalVatRate != null) {
+    if (finalVatRate === 0) finalVatCode = 'ZERO';
+    else if (finalVatRate === 20) finalVatCode = 'STANDARD';
+    else if (finalVatRate === 5) finalVatCode = 'REDUCED';
+  } else if (finalVatCode && finalVatRate == null) {
+    if (finalVatCode === 'ZERO' || finalVatCode === 'EXEMPT') finalVatRate = 0;
+    else if (finalVatCode === 'STANDARD') finalVatRate = 20;
+    else if (finalVatCode === 'REDUCED') finalVatRate = 5;
+  }
+
   const payload = {
     companyId,
     clientId,
@@ -643,8 +679,8 @@ async function createProduct(data, reqUser) {
     price: data.price ?? 0,
     costPrice: unitCost,
     packSize: packSize,
-    vatRate: data.vatRate != null ? data.vatRate : null,
-    vatCode: data.vatCode || null,
+    vatRate: finalVatRate,
+    vatCode: finalVatCode,
     customsTariff: data.customsTariff != null ? String(data.customsTariff) : null,
     marketplaceSkus: data.marketplaceSkus && typeof data.marketplaceSkus === 'object' ? data.marketplaceSkus : null,
     heatSensitive: data.heatSensitive || null,
@@ -766,7 +802,10 @@ async function bulkCreateProducts(productsArray, reqUser, explicitCompanyId) {
         }
       }
 
-      const existing = await Product.findOne({ where: { companyId: resolvedCompanyId, clientId: resolvedClientId || null, sku: String(data.sku).trim() } });
+      let existing = await Product.findOne({ where: { companyId: resolvedCompanyId, clientId: resolvedClientId || null, sku: String(data.sku).trim() } });
+      if (!existing) {
+        existing = await Product.findOne({ where: { companyId: resolvedCompanyId, sku: String(data.sku).trim() } });
+      }
 
       // Resolve categoryId (ID or Name)
       let resolvedCategoryId = null;
@@ -852,6 +891,22 @@ async function bulkCreateProducts(productsArray, reqUser, explicitCompanyId) {
         resolvedDefaultPickingLocationId = existing ? existing.defaultPickingLocationId : null;
       }
 
+      let resolvedVatRate = data.vatRate != null && data.vatRate !== '' ? Number(data.vatRate) : (existing && existing.vatRate != null ? Number(existing.vatRate) : null);
+      let resolvedVatCode = data.vatCode ? String(data.vatCode).trim().toUpperCase() : (existing && existing.vatCode ? String(existing.vatCode).trim().toUpperCase() : null);
+
+      if (!resolvedVatCode && resolvedVatRate != null) {
+        if (resolvedVatRate === 0) resolvedVatCode = 'ZERO';
+        else if (resolvedVatRate === 20) resolvedVatCode = 'STANDARD';
+        else if (resolvedVatRate === 5) resolvedVatCode = 'REDUCED';
+      } else if (resolvedVatCode && resolvedVatRate == null) {
+        if (resolvedVatCode === 'ZERO' || resolvedVatCode === 'EXEMPT') resolvedVatRate = 0;
+        else if (resolvedVatCode === 'STANDARD') resolvedVatRate = 20;
+        else if (resolvedVatCode === 'REDUCED') resolvedVatRate = 5;
+      } else if (!resolvedVatCode && resolvedVatRate == null) {
+        resolvedVatRate = 20;
+        resolvedVatCode = 'STANDARD';
+      }
+
       const productData = {
         companyId: resolvedCompanyId,
         clientId: resolvedClientId,
@@ -874,8 +929,8 @@ async function bulkCreateProducts(productsArray, reqUser, explicitCompanyId) {
           return existing ? existing.costPrice : 0;
         })(),
         packSize: data.packSize != null ? Number(data.packSize) : (existing ? existing.packSize : 1),
-        vatRate: data.vatRate != null ? Number(data.vatRate) : (existing ? existing.vatRate : null),
-        vatCode: data.vatCode || (existing ? existing.vatCode : null),
+        vatRate: resolvedVatRate,
+        vatCode: resolvedVatCode,
         customsTariff: data.customsTariff != null ? String(data.customsTariff) : (existing ? existing.customsTariff : null),
         marketplaceSkus: (data.marketplaceSkus && typeof data.marketplaceSkus === 'object') ? data.marketplaceSkus : (existing ? existing.marketplaceSkus : null),
         heatSensitive: data.heatSensitive || (existing ? existing.heatSensitive : null),
@@ -981,8 +1036,22 @@ async function updateProduct(id, data, reqUser) {
     const rawCost = Number(data.costPrice) || 0;
     upd.costPrice = newPackSize > 0 ? (rawCost / newPackSize) : rawCost;
   }
-  if (data.vatRate !== undefined) upd.vatRate = data.vatRate;
-  if (data.vatCode !== undefined) upd.vatCode = data.vatCode;
+  if (data.vatRate !== undefined || data.vatCode !== undefined) {
+    let newRate = data.vatRate !== undefined ? (data.vatRate != null && data.vatRate !== '' ? Number(data.vatRate) : null) : (product.vatRate != null ? Number(product.vatRate) : null);
+    let newCode = data.vatCode !== undefined ? (data.vatCode ? String(data.vatCode).trim().toUpperCase() : null) : (product.vatCode ? String(product.vatCode).trim().toUpperCase() : null);
+
+    if (!newCode && newRate != null) {
+      if (newRate === 0) newCode = 'ZERO';
+      else if (newRate === 20) newCode = 'STANDARD';
+      else if (newRate === 5) newCode = 'REDUCED';
+    } else if (newCode && newRate == null) {
+      if (newCode === 'ZERO' || newCode === 'EXEMPT') newRate = 0;
+      else if (newCode === 'STANDARD') newRate = 20;
+      else if (newCode === 'REDUCED') newRate = 5;
+    }
+    upd.vatRate = newRate;
+    upd.vatCode = newCode;
+  }
   if (data.customsTariff !== undefined) upd.customsTariff = data.customsTariff != null ? String(data.customsTariff) : null;
   if (data.marketplaceSkus !== undefined) upd.marketplaceSkus = data.marketplaceSkus && typeof data.marketplaceSkus === 'object' ? data.marketplaceSkus : product.marketplaceSkus;
   if (data.heatSensitive !== undefined) upd.heatSensitive = data.heatSensitive;

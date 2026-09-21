@@ -18,7 +18,7 @@ async function list(reqUser, query = {}) {
       association: 'BundleItems',
       include: [{
         association: 'Product',
-        attributes: ['id', 'name', 'sku', 'costPrice', 'price'],
+        attributes: ['id', 'name', 'sku', 'costPrice', 'price', 'images'],
         include: [{
           association: 'ProductStocks',
           attributes: ['quantity', 'reserved']
@@ -29,6 +29,7 @@ async function list(reqUser, query = {}) {
   return bundles.map(b => {
     const j = b.toJSON();
     let minBuildable = Infinity;
+    let autoCostPrice = 0;
     if (j.BundleItems && j.BundleItems.length > 0) {
       j.bundleItems = j.BundleItems.map(it => {
         const prod = it.Product;
@@ -37,6 +38,9 @@ async function list(reqUser, query = {}) {
         const buildable = Math.floor(totalStock / reqQty);
         if (buildable < minBuildable) {
           minBuildable = buildable;
+        }
+        if (prod?.costPrice != null) {
+          autoCostPrice += Number(prod.costPrice) * reqQty;
         }
         return {
           id: it.id,
@@ -54,6 +58,9 @@ async function list(reqUser, query = {}) {
     }
     j.quantity = minBuildable === Infinity ? 0 : minBuildable;
     j.availableStock = j.quantity;
+    if (j.costPrice == null || Number(j.costPrice) === 0) {
+      j.costPrice = autoCostPrice > 0 ? (Math.round(autoCostPrice * 100) / 100) : (Number(j.costPrice) || 0);
+    }
     return j;
   });
 }
@@ -64,7 +71,7 @@ async function getById(id, reqUser) {
       association: 'BundleItems',
       include: [{
         association: 'Product',
-        attributes: ['id', 'name', 'sku', 'costPrice', 'price'],
+        attributes: ['id', 'name', 'sku', 'costPrice', 'price', 'images'],
         include: [{
           association: 'ProductStocks',
           attributes: ['quantity', 'reserved']
@@ -76,6 +83,7 @@ async function getById(id, reqUser) {
   if (reqUser.role !== 'super_admin' && bundle.companyId !== reqUser.companyId) throw new Error('Bundle not found');
   const j = bundle.toJSON();
   let minBuildable = Infinity;
+  let autoCostPrice = 0;
   if (j.BundleItems && j.BundleItems.length > 0) {
     j.bundleItems = j.BundleItems.map(it => {
       const prod = it.Product;
@@ -84,6 +92,9 @@ async function getById(id, reqUser) {
       const buildable = Math.floor(totalStock / reqQty);
       if (buildable < minBuildable) {
         minBuildable = buildable;
+      }
+      if (prod?.costPrice != null) {
+        autoCostPrice += Number(prod.costPrice) * reqQty;
       }
       return {
         id: it.id,
@@ -101,6 +112,9 @@ async function getById(id, reqUser) {
   }
   j.quantity = minBuildable === Infinity ? 0 : minBuildable;
   j.availableStock = j.quantity;
+  if (j.costPrice == null || Number(j.costPrice) === 0) {
+    j.costPrice = autoCostPrice > 0 ? (Math.round(autoCostPrice * 100) / 100) : (Number(j.costPrice) || 0);
+  }
   return j;
 }
 
@@ -109,16 +123,29 @@ async function create(data, reqUser) {
   if (!companyId) throw new Error('companyId required');
   const existing = await Bundle.findOne({ where: { companyId, sku: (data.sku || '').trim() } });
   if (existing) throw new Error('Bundle SKU already exists for this company');
+
+  let costPrice = data.costPrice != null && Number(data.costPrice) > 0 ? Number(data.costPrice) : 0;
+  const items = Array.isArray(data.bundleItems) ? data.bundleItems.filter(i => i.productId && i.quantity > 0) : [];
+  if (costPrice === 0 && items.length > 0) {
+    const prods = await Product.findAll({ where: { id: items.map(i => i.productId) }, attributes: ['id', 'costPrice'] });
+    let calcCost = 0;
+    items.forEach(it => {
+      const pr = prods.find(p => p.id === it.productId);
+      if (pr?.costPrice != null) calcCost += Number(pr.costPrice) * Number(it.quantity);
+    });
+    if (calcCost > 0) costPrice = Math.round(calcCost * 100) / 100;
+  }
+
   const bundle = await Bundle.create({
     companyId,
     sku: (data.sku || '').trim(),
     name: data.name,
     description: data.description || null,
-    costPrice: data.costPrice ?? 0,
+    costPrice,
     sellingPrice: data.sellingPrice ?? 0,
     status: data.status || 'ACTIVE',
+    images: data.images !== undefined ? data.images : null,
   });
-  const items = Array.isArray(data.bundleItems) ? data.bundleItems.filter(i => i.productId && i.quantity > 0) : [];
   for (const it of items) {
     await BundleItem.create({ bundleId: bundle.id, productId: it.productId, quantity: it.quantity });
   }
@@ -129,13 +156,27 @@ async function update(id, data, reqUser) {
   const bundle = await Bundle.findByPk(id);
   if (!bundle) throw new Error('Bundle not found');
   if (reqUser.role !== 'super_admin' && bundle.companyId !== reqUser.companyId) throw new Error('Bundle not found');
+
+  let costPrice = data.costPrice !== undefined ? (Number(data.costPrice) || 0) : Number(bundle.costPrice || 0);
+  const items = Array.isArray(data.bundleItems) ? data.bundleItems.filter(i => i.productId && i.quantity > 0) : [];
+  if (costPrice === 0 && items.length > 0) {
+    const prods = await Product.findAll({ where: { id: items.map(i => i.productId) }, attributes: ['id', 'costPrice'] });
+    let calcCost = 0;
+    items.forEach(it => {
+      const pr = prods.find(p => p.id === it.productId);
+      if (pr?.costPrice != null) calcCost += Number(pr.costPrice) * Number(it.quantity);
+    });
+    if (calcCost > 0) costPrice = Math.round(calcCost * 100) / 100;
+  }
+
   await bundle.update({
     name: data.name ?? bundle.name,
     sku: data.sku !== undefined ? data.sku.trim() : bundle.sku,
     description: data.description !== undefined ? data.description : bundle.description,
-    costPrice: data.costPrice !== undefined ? data.costPrice : bundle.costPrice,
+    costPrice,
     sellingPrice: data.sellingPrice !== undefined ? data.sellingPrice : bundle.sellingPrice,
     status: data.status ?? bundle.status,
+    images: data.images !== undefined ? data.images : bundle.images,
   });
   if (Array.isArray(data.bundleItems)) {
     await BundleItem.destroy({ where: { bundleId: bundle.id } });
@@ -339,7 +380,8 @@ async function convertFromProduct(productId, data, reqUser) {
       description: data.description || product.description || `Converted from Product ${product.sku}`,
       costPrice: data.costPrice != null ? data.costPrice : (product.costPrice || 0),
       sellingPrice: data.sellingPrice != null ? data.sellingPrice : (product.price || 0),
-      status: 'ACTIVE'
+      status: 'ACTIVE',
+      images: data.images !== undefined ? data.images : (product.images || null)
     });
   } else {
     await bundle.update({
@@ -347,7 +389,8 @@ async function convertFromProduct(productId, data, reqUser) {
       description: data.description || bundle.description,
       costPrice: data.costPrice != null ? data.costPrice : bundle.costPrice,
       sellingPrice: data.sellingPrice != null ? data.sellingPrice : bundle.sellingPrice,
-      status: 'ACTIVE'
+      status: 'ACTIVE',
+      images: data.images !== undefined ? data.images : (product.images || bundle.images)
     });
   }
 

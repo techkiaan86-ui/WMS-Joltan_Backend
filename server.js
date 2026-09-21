@@ -368,6 +368,9 @@ async function start() {
         { t: 'customization_mappings', c: 'outOfStock', type: 'TINYINT(1) DEFAULT 0' },
         { t: 'customization_mappings', c: 'extra', type: 'VARCHAR(255)' },
         { t: 'customization_mappings', c: 'costPrice', type: 'DECIMAL(10, 2)' },
+        { t: 'customization_mappings', c: 'cost_price', type: 'DECIMAL(10, 2)' },
+        { t: 'customization_mappings', c: 'expected_count', type: 'INT' },
+        { t: 'customization_mappings', c: 'expectedCount', type: 'INT' },
       ];
       for (const col of manualCols) {
         try {
@@ -897,6 +900,24 @@ async function start() {
       await sequelize.query("ALTER TABLE product_pool ADD COLUMN weight VARCHAR(100) NULL").catch(() => {});
       await sequelize.query("ALTER TABLE product_pool ADD COLUMN cost_price DECIMAL(12,2) DEFAULT 0.00").catch(() => {});
       await sequelize.query("ALTER TABLE product_pool ADD COLUMN raw_details LONGTEXT NULL").catch(() => {});
+      await sequelize.query("ALTER TABLE products ADD COLUMN vatRate DECIMAL(5,2) NULL").catch(() => {});
+      await sequelize.query("ALTER TABLE products ADD COLUMN vatCode VARCHAR(255) NULL").catch(() => {});
+      await sequelize.query("ALTER TABLE products ADD COLUMN vat_rate DECIMAL(5,2) NULL").catch(() => {});
+      await sequelize.query("ALTER TABLE products ADD COLUMN vat_code VARCHAR(255) NULL").catch(() => {});
+
+      // Backfill missing VAT for existing products in database
+      await sequelize.query("UPDATE products SET vatCode = 'ZERO' WHERE vatRate = 0 AND (vatCode IS NULL OR vatCode = '')").catch(() => {});
+      await sequelize.query("UPDATE products SET vatRate = 0.00 WHERE UPPER(vatCode) = 'ZERO' AND vatRate IS NULL").catch(() => {});
+      await sequelize.query("UPDATE products SET vatRate = 20.00, vatCode = 'STANDARD' WHERE (vatRate IS NULL OR vatRate = '') AND (vatCode IS NULL OR vatCode = '')").catch(() => {});
+
+      // Clean up fake dummy ProductStock auto-created with quantity 100 and no batch/expiry
+      await sequelize.query(`
+        DELETE FROM product_stocks 
+        WHERE quantity = 100 
+          AND (allocated_qty = 0 OR allocated_qty IS NULL)
+          AND (batch_number IS NULL OR batch_number = '') 
+          AND best_before_date IS NULL
+      `).catch(() => {});
 
       const { Product, ProductPool } = require('./models');
       await Product.destroy({ where: { sku: 'UNMATCHED-POOL' } }).catch(() => {});
