@@ -138,6 +138,7 @@ app.post('/api/products/:id/alternative-skus', authenticate, requireRole(...invP
 const productPoolController = require('./controllers/productPoolController');
 app.get('/api/products/pool', authenticate, requireRole(...dashboardRoles), productPoolController.list);
 app.post('/api/products/pool/scan', authenticate, requireRole(...invProductRoles), productPoolController.scan);
+app.post('/api/products/pool/import', authenticate, requireRole(...invProductRoles), productPoolController.bulkImport);
 app.post('/api/products/pool/:id/match-alternative', authenticate, requireRole(...invProductRoles), productPoolController.matchAlternative);
 app.post('/api/products/pool/:id/match-bundle', authenticate, requireRole(...invProductRoles), productPoolController.matchBundle);
 app.post('/api/products/pool/:id/create-product', authenticate, requireRole(...invProductRoles), productPoolController.createProduct);

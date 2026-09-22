@@ -30,6 +30,7 @@ async function list(reqUser, query = {}) {
     const j = b.toJSON();
     let minBuildable = Infinity;
     let autoCostPrice = 0;
+    let autoSellingPrice = 0;
     if (j.BundleItems && j.BundleItems.length > 0) {
       j.bundleItems = j.BundleItems.map(it => {
         const prod = it.Product;
@@ -41,6 +42,9 @@ async function list(reqUser, query = {}) {
         }
         if (prod?.costPrice != null) {
           autoCostPrice += Number(prod.costPrice) * reqQty;
+        }
+        if (prod?.price != null) {
+          autoSellingPrice += Number(prod.price) * reqQty;
         }
         return {
           id: it.id,
@@ -60,6 +64,9 @@ async function list(reqUser, query = {}) {
     j.availableStock = j.quantity;
     if (j.costPrice == null || Number(j.costPrice) === 0) {
       j.costPrice = autoCostPrice > 0 ? (Math.round(autoCostPrice * 100) / 100) : (Number(j.costPrice) || 0);
+    }
+    if (j.sellingPrice == null || Number(j.sellingPrice) === 0) {
+      j.sellingPrice = autoSellingPrice > 0 ? (Math.round(autoSellingPrice * 100) / 100) : (Number(j.sellingPrice) || 0);
     }
     return j;
   });
@@ -84,6 +91,7 @@ async function getById(id, reqUser) {
   const j = bundle.toJSON();
   let minBuildable = Infinity;
   let autoCostPrice = 0;
+  let autoSellingPrice = 0;
   if (j.BundleItems && j.BundleItems.length > 0) {
     j.bundleItems = j.BundleItems.map(it => {
       const prod = it.Product;
@@ -95,6 +103,9 @@ async function getById(id, reqUser) {
       }
       if (prod?.costPrice != null) {
         autoCostPrice += Number(prod.costPrice) * reqQty;
+      }
+      if (prod?.price != null) {
+        autoSellingPrice += Number(prod.price) * reqQty;
       }
       return {
         id: it.id,
@@ -115,6 +126,9 @@ async function getById(id, reqUser) {
   if (j.costPrice == null || Number(j.costPrice) === 0) {
     j.costPrice = autoCostPrice > 0 ? (Math.round(autoCostPrice * 100) / 100) : (Number(j.costPrice) || 0);
   }
+  if (j.sellingPrice == null || Number(j.sellingPrice) === 0) {
+    j.sellingPrice = autoSellingPrice > 0 ? (Math.round(autoSellingPrice * 100) / 100) : (Number(j.sellingPrice) || 0);
+  }
   return j;
 }
 
@@ -125,15 +139,19 @@ async function create(data, reqUser) {
   if (existing) throw new Error('Bundle SKU already exists for this company');
 
   let costPrice = data.costPrice != null && Number(data.costPrice) > 0 ? Number(data.costPrice) : 0;
+  let sellingPrice = data.sellingPrice != null && Number(data.sellingPrice) > 0 ? Number(data.sellingPrice) : 0;
   const items = Array.isArray(data.bundleItems) ? data.bundleItems.filter(i => i.productId && i.quantity > 0) : [];
-  if (costPrice === 0 && items.length > 0) {
-    const prods = await Product.findAll({ where: { id: items.map(i => i.productId) }, attributes: ['id', 'costPrice'] });
+  if ((costPrice === 0 || sellingPrice === 0) && items.length > 0) {
+    const prods = await Product.findAll({ where: { id: items.map(i => i.productId) }, attributes: ['id', 'costPrice', 'price'] });
     let calcCost = 0;
+    let calcSelling = 0;
     items.forEach(it => {
       const pr = prods.find(p => p.id === it.productId);
       if (pr?.costPrice != null) calcCost += Number(pr.costPrice) * Number(it.quantity);
+      if (pr?.price != null) calcSelling += Number(pr.price) * Number(it.quantity);
     });
-    if (calcCost > 0) costPrice = Math.round(calcCost * 100) / 100;
+    if (costPrice === 0 && calcCost > 0) costPrice = Math.round(calcCost * 100) / 100;
+    if (sellingPrice === 0 && calcSelling > 0) sellingPrice = Math.round(calcSelling * 100) / 100;
   }
 
   const bundle = await Bundle.create({
@@ -142,7 +160,7 @@ async function create(data, reqUser) {
     name: data.name,
     description: data.description || null,
     costPrice,
-    sellingPrice: data.sellingPrice ?? 0,
+    sellingPrice,
     status: data.status || 'ACTIVE',
     images: data.images !== undefined ? data.images : null,
   });
@@ -158,15 +176,19 @@ async function update(id, data, reqUser) {
   if (reqUser.role !== 'super_admin' && bundle.companyId !== reqUser.companyId) throw new Error('Bundle not found');
 
   let costPrice = data.costPrice !== undefined ? (Number(data.costPrice) || 0) : Number(bundle.costPrice || 0);
+  let sellingPrice = data.sellingPrice !== undefined ? (Number(data.sellingPrice) || 0) : Number(bundle.sellingPrice || 0);
   const items = Array.isArray(data.bundleItems) ? data.bundleItems.filter(i => i.productId && i.quantity > 0) : [];
-  if (costPrice === 0 && items.length > 0) {
-    const prods = await Product.findAll({ where: { id: items.map(i => i.productId) }, attributes: ['id', 'costPrice'] });
+  if ((costPrice === 0 || sellingPrice === 0) && items.length > 0) {
+    const prods = await Product.findAll({ where: { id: items.map(i => i.productId) }, attributes: ['id', 'costPrice', 'price'] });
     let calcCost = 0;
+    let calcSelling = 0;
     items.forEach(it => {
       const pr = prods.find(p => p.id === it.productId);
       if (pr?.costPrice != null) calcCost += Number(pr.costPrice) * Number(it.quantity);
+      if (pr?.price != null) calcSelling += Number(pr.price) * Number(it.quantity);
     });
-    if (calcCost > 0) costPrice = Math.round(calcCost * 100) / 100;
+    if (costPrice === 0 && calcCost > 0) costPrice = Math.round(calcCost * 100) / 100;
+    if (sellingPrice === 0 && calcSelling > 0) sellingPrice = Math.round(calcSelling * 100) / 100;
   }
 
   await bundle.update({
@@ -174,7 +196,7 @@ async function update(id, data, reqUser) {
     sku: data.sku !== undefined ? data.sku.trim() : bundle.sku,
     description: data.description !== undefined ? data.description : bundle.description,
     costPrice,
-    sellingPrice: data.sellingPrice !== undefined ? data.sellingPrice : bundle.sellingPrice,
+    sellingPrice,
     status: data.status ?? bundle.status,
     images: data.images !== undefined ? data.images : bundle.images,
   });
@@ -349,18 +371,29 @@ async function convertFromProduct(productId, data, reqUser) {
       });
     }
 
-    // Recalculate bundle cost price from all its components
+    // Recalculate bundle cost price and selling price from all its components
     const allBundleItems = await BundleItem.findAll({
       where: { bundleId: targetBundle.id },
       include: [{ association: 'Product' }]
     });
     let calculatedBundleCost = 0;
+    let calculatedBundleSelling = 0;
     for (const bi of allBundleItems) {
       const pCost = bi.Product?.costPrice != null ? Number(bi.Product.costPrice) : (Number(bi.Product?.price || 0) * 0.6);
       calculatedBundleCost += pCost * (bi.quantity || 1);
+      if (bi.Product?.price != null) {
+        calculatedBundleSelling += Number(bi.Product.price) * (bi.quantity || 1);
+      }
     }
+    const targetUpdate = {};
     if (calculatedBundleCost > 0) {
-      await targetBundle.update({ costPrice: Number(calculatedBundleCost.toFixed(2)) });
+      targetUpdate.costPrice = Number(calculatedBundleCost.toFixed(2));
+    }
+    if (calculatedBundleSelling > 0 && (!targetBundle.sellingPrice || Number(targetBundle.sellingPrice) === 0)) {
+      targetUpdate.sellingPrice = Number(calculatedBundleSelling.toFixed(2));
+    }
+    if (Object.keys(targetUpdate).length > 0) {
+      await targetBundle.update(targetUpdate);
     }
 
     return getById(targetBundle.id, reqUser);
@@ -370,6 +403,14 @@ async function convertFromProduct(productId, data, reqUser) {
   const bundleSku = (data.sku || product.sku).trim();
   const bundleName = (data.name || data.bundleName || product.name).trim();
 
+  let initialSellingPrice = (data.sellingPrice != null && Number(data.sellingPrice) > 0)
+    ? Number(data.sellingPrice)
+    : (product.price != null && Number(product.price) > 0 ? Number(product.price) : 0);
+
+  let initialCostPrice = (data.costPrice != null && Number(data.costPrice) > 0)
+    ? Number(data.costPrice)
+    : (product.costPrice != null && Number(product.costPrice) > 0 ? Number(product.costPrice) : 0);
+
   // Find or create Bundle record
   let bundle = await Bundle.findOne({ where: { companyId: product.companyId, sku: bundleSku } });
   if (!bundle) {
@@ -378,8 +419,8 @@ async function convertFromProduct(productId, data, reqUser) {
       sku: bundleSku,
       name: bundleName,
       description: data.description || product.description || `Converted from Product ${product.sku}`,
-      costPrice: data.costPrice != null ? data.costPrice : (product.costPrice || 0),
-      sellingPrice: data.sellingPrice != null ? data.sellingPrice : (product.price || 0),
+      costPrice: initialCostPrice,
+      sellingPrice: initialSellingPrice,
       status: 'ACTIVE',
       images: data.images !== undefined ? data.images : (product.images || null)
     });
@@ -387,8 +428,8 @@ async function convertFromProduct(productId, data, reqUser) {
     await bundle.update({
       name: bundleName,
       description: data.description || bundle.description,
-      costPrice: data.costPrice != null ? data.costPrice : bundle.costPrice,
-      sellingPrice: data.sellingPrice != null ? data.sellingPrice : bundle.sellingPrice,
+      costPrice: initialCostPrice > 0 ? initialCostPrice : bundle.costPrice,
+      sellingPrice: initialSellingPrice > 0 ? initialSellingPrice : bundle.sellingPrice,
       status: 'ACTIVE',
       images: data.images !== undefined ? data.images : (product.images || bundle.images)
     });
@@ -399,16 +440,35 @@ async function convertFromProduct(productId, data, reqUser) {
   if (incomingItems && incomingItems.length > 0) {
     await BundleItem.destroy({ where: { bundleId: bundle.id } });
     let calculatedCost = 0;
+    let calculatedSelling = 0;
     for (const it of incomingItems.filter(i => i.productId && i.quantity > 0)) {
       await BundleItem.create({ bundleId: bundle.id, productId: it.productId, quantity: it.quantity });
       const compProduct = await Product.findByPk(it.productId);
       if (compProduct) {
         const compCost = compProduct.costPrice != null ? Number(compProduct.costPrice) : (Number(compProduct.price || 0) * 0.6);
         calculatedCost += compCost * Number(it.quantity);
+        if (compProduct.price != null && Number(compProduct.price) > 0) {
+          calculatedSelling += Number(compProduct.price) * Number(it.quantity);
+        }
       }
     }
+    const updateFields = {};
     if (calculatedCost > 0) {
-      await bundle.update({ costPrice: Number(calculatedCost.toFixed(2)) });
+      updateFields.costPrice = Number(calculatedCost.toFixed(2));
+    }
+    if (!bundle.sellingPrice || Number(bundle.sellingPrice) === 0) {
+      if (initialSellingPrice > 0) {
+        updateFields.sellingPrice = Number(initialSellingPrice.toFixed(2));
+      } else if (calculatedSelling > 0) {
+        updateFields.sellingPrice = Number(calculatedSelling.toFixed(2));
+      }
+    }
+    if (Object.keys(updateFields).length > 0) {
+      await bundle.update(updateFields);
+    }
+  } else {
+    if ((!bundle.sellingPrice || Number(bundle.sellingPrice) === 0) && initialSellingPrice > 0) {
+      await bundle.update({ sellingPrice: Number(initialSellingPrice.toFixed(2)) });
     }
   }
 

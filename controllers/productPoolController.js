@@ -352,8 +352,21 @@ async function list(req, res, next) {
     const { count, rows } = await ProductPool.findAndCountAll({
       where,
       include: [
-        { association: 'ResolvedProduct', attributes: ['id', 'name', 'sku', 'price', 'barcode'], required: false },
-        { association: 'ResolvedBundle', attributes: ['id', 'name', 'sku'], required: false }
+        { association: 'ResolvedProduct', attributes: ['id', 'name', 'sku', 'price', 'costPrice', 'barcode', 'weight'], required: false },
+        {
+          association: 'ResolvedBundle',
+          attributes: ['id', 'name', 'sku', 'costPrice', 'sellingPrice'],
+          required: false,
+          include: [{
+            association: 'BundleItems',
+            required: false,
+            include: [{
+              association: 'Product',
+              attributes: ['id', 'name', 'sku', 'costPrice', 'price'],
+              required: false
+            }]
+          }]
+        }
       ],
       order: [
         ['id', 'DESC']
@@ -361,6 +374,73 @@ async function list(req, res, next) {
       limit,
       offset
     });
+
+    // Enrich costPrice, barcode, and weight from ResolvedProduct, ResolvedBundle, catalog Product, or formula
+    for (const item of rows) {
+      let resolvedCost = Number(item.costPrice || 0);
+
+      // 1. From ResolvedProduct
+      if (resolvedCost <= 0 && item.ResolvedProduct && Number(item.ResolvedProduct.costPrice) > 0) {
+        resolvedCost = Number(item.ResolvedProduct.costPrice);
+      }
+
+      // 2. From ResolvedBundle (direct bundle costPrice or sum of BundleItems)
+      if (resolvedCost <= 0 && item.ResolvedBundle) {
+        if (Number(item.ResolvedBundle.costPrice) > 0) {
+          resolvedCost = Number(item.ResolvedBundle.costPrice);
+        } else if (item.ResolvedBundle.BundleItems && item.ResolvedBundle.BundleItems.length > 0) {
+          const sumComp = item.ResolvedBundle.BundleItems.reduce((acc, bi) => {
+            const cCost = Number(bi.Product?.costPrice || 0);
+            const q = Number(bi.quantity || 1);
+            return acc + (cCost * q);
+          }, 0);
+          if (sumComp > 0) resolvedCost = Number(sumComp.toFixed(2));
+        }
+        if (resolvedCost <= 0 && Number(item.ResolvedBundle.sellingPrice) > 0) {
+          resolvedCost = Number((Number(item.ResolvedBundle.sellingPrice) * 0.6).toFixed(2));
+        }
+      }
+
+      // 3. From catalog Product with matching SKU
+      if (resolvedCost <= 0 || !item.barcode) {
+        try {
+          const catProd = await Product.findOne({
+            where: { sku: item.sku },
+            attributes: ['id', 'costPrice', 'barcode', 'weight']
+          });
+          if (catProd) {
+            if (resolvedCost <= 0 && Number(catProd.costPrice) > 0) {
+              resolvedCost = Number(catProd.costPrice);
+            }
+            if (!item.barcode && catProd.barcode) {
+              item.setDataValue('barcode', catProd.barcode);
+            }
+            if (!item.weight && catProd.weight) {
+              item.setDataValue('weight', catProd.weight);
+            }
+          }
+        } catch (_) {}
+      }
+
+      // 4. Fallback: calculate standard cost from selling price (60%) if not yet recorded
+      if (resolvedCost <= 0) {
+        const spPrice = Number(item.unitPrice || 0);
+        if (spPrice > 0) {
+          resolvedCost = Number((spPrice * 0.6).toFixed(2));
+        }
+      }
+
+      if (resolvedCost > 0) {
+        item.setDataValue('costPrice', resolvedCost);
+      }
+
+      if (!item.barcode && item.ResolvedProduct?.barcode) {
+        item.setDataValue('barcode', item.ResolvedProduct.barcode);
+      }
+      if (!item.weight && item.ResolvedProduct?.weight) {
+        item.setDataValue('weight', item.ResolvedProduct.weight);
+      }
+    }
 
     // Compute stats for tabs/badges
     const baseWhere = {
@@ -493,11 +573,13 @@ async function matchBundle(req, res, next) {
 
     if (!targetBundle && bundleName) {
       // Create new bundle
+      const poolSelling = Number(poolItem.unitPrice || 0);
       targetBundle = await Bundle.create({
         companyId: poolItem.companyId || 1,
         sku: poolItem.sku,
         name: bundleName || poolItem.name || poolItem.sku,
         description: `Created from Product Pool for SKU ${poolItem.sku}`,
+        sellingPrice: poolSelling > 0 ? poolSelling : 0,
         status: 'ACTIVE'
       });
     }
@@ -531,20 +613,37 @@ async function matchBundle(req, res, next) {
       });
     }
 
-    // 3. Recalculate bundle cost price from all its components
+    // 3. Recalculate bundle cost price and selling price from all its components
     try {
       const allBundleItems = await BundleItem.findAll({
         where: { bundleId: targetBundle.id },
         include: [{ association: 'Product' }]
       });
       let calculatedBundleCost = 0;
+      let calculatedBundleSelling = 0;
       for (const bi of allBundleItems) {
         const itemCost = Number(bi.Product?.costPrice || 0);
+        const itemSelling = Number(bi.Product?.price || 0);
         const itemQty = Number(bi.quantity || 1);
         calculatedBundleCost += itemCost * itemQty;
+        calculatedBundleSelling += itemSelling * itemQty;
       }
+      const bundleUpdates = {};
       if (calculatedBundleCost > 0) {
-        await targetBundle.update({ costPrice: parseFloat(calculatedBundleCost.toFixed(2)) });
+        bundleUpdates.costPrice = parseFloat(calculatedBundleCost.toFixed(2));
+      }
+      if (!targetBundle.sellingPrice || Number(targetBundle.sellingPrice) === 0) {
+        const poolSelling = Number(poolItem.unitPrice || 0);
+        if (poolSelling > 0) {
+          bundleUpdates.sellingPrice = poolSelling;
+        } else if (product?.price && Number(product.price) > 0) {
+          bundleUpdates.sellingPrice = Number(product.price);
+        } else if (calculatedBundleSelling > 0) {
+          bundleUpdates.sellingPrice = parseFloat(calculatedBundleSelling.toFixed(2));
+        }
+      }
+      if (Object.keys(bundleUpdates).length > 0) {
+        await targetBundle.update(bundleUpdates);
       }
     } catch (_) {}
 
@@ -728,9 +827,159 @@ async function scan(req, res, next) {
   }
 }
 
+function parseCleanNumber(val) {
+  if (val == null || val === '') return 0;
+  if (typeof val === 'number') return isNaN(val) ? 0 : val;
+  const cleaned = String(val).replace(/[^0-9.-]/g, '').trim();
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : num;
+}
+
+/**
+ * Bulk Import items into Product Pool
+ */
+async function bulkImport(req, res, next) {
+  try {
+    await ensureTableExists();
+    const companyId = (req.user && req.user.role !== 'super_admin' && req.user.companyId) ? req.user.companyId : (req.body.companyId || 1);
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, message: 'No items provided for import' });
+    }
+
+    let createdCount = 0;
+    let updatedCount = 0;
+    let skippedCount = 0;
+
+    for (const item of items) {
+      const sku = (item.sku || '').toString().trim();
+      if (!sku || sku.toLowerCase() === 'undefined' || sku.toLowerCase() === 'null') {
+        skippedCount++;
+        continue;
+      }
+
+      const cleanName = (item.name || item.title || item.productName || sku).toString().trim();
+      const channel = (item.channel || item.origin || 'CSV_IMPORT').toString().trim();
+      const barcode = (item.barcode || item.upc || item.ean || '').toString().trim() || null;
+      const unitPrice = parseCleanNumber(item.unitPrice || item.price || item.unit_price || item.sellingPrice);
+      const costPrice = parseCleanNumber(item.costPrice || item.cost || item.cost_price || item.unitCost);
+      const weight = item.weight ? String(item.weight).trim() : null;
+      const notes = (item.notes || item.note || 'Imported via CSV/Excel').toString().trim();
+
+      let existing = await ProductPool.findOne({
+        where: {
+          sku,
+          [Op.or]: [
+            { companyId },
+            { companyId: 1 },
+            { companyId: null }
+          ]
+        }
+      });
+
+      if (existing) {
+        const updateFields = {};
+        if (cleanName) updateFields.name = cleanName;
+        if (barcode) updateFields.barcode = barcode;
+        if (unitPrice > 0) updateFields.unitPrice = unitPrice;
+        if (costPrice > 0) updateFields.costPrice = costPrice;
+        if (weight) updateFields.weight = weight;
+        if (notes) updateFields.notes = notes;
+
+        await existing.update(updateFields);
+
+        // Direct SQL update to guarantee persistence in MySQL
+        await sequelize.query(`
+          UPDATE product_pool
+          SET barcode = COALESCE(:barcode, barcode),
+              cost_price = CASE WHEN :costPrice > 0 THEN :costPrice ELSE cost_price END,
+              unit_price = CASE WHEN :unitPrice > 0 THEN :unitPrice ELSE unit_price END,
+              weight = COALESCE(:weight, weight),
+              name = COALESCE(:name, name)
+          WHERE id = :id
+        `, {
+          replacements: {
+            barcode: barcode || null,
+            costPrice: costPrice || 0,
+            unitPrice: unitPrice || 0,
+            weight: weight || null,
+            name: cleanName || null,
+            id: existing.id
+          }
+        }).catch(err => console.warn('[bulkImport SQL update warn]:', err.message));
+
+        updatedCount++;
+      } else {
+        const newPool = await ProductPool.create({
+          companyId,
+          sku,
+          name: cleanName,
+          channel,
+          orderNumber: item.orderNumber || null,
+          barcode,
+          unitPrice,
+          costPrice,
+          weight,
+          status: 'PENDING',
+          notes
+        });
+
+        if (barcode || costPrice > 0) {
+          await sequelize.query(`
+            UPDATE product_pool
+            SET barcode = COALESCE(:barcode, barcode),
+                cost_price = CASE WHEN :costPrice > 0 THEN :costPrice ELSE cost_price END
+            WHERE id = :id
+          `, {
+            replacements: {
+              barcode: barcode || null,
+              costPrice: costPrice || 0,
+              id: newPool.id
+            }
+          }).catch(() => {});
+        }
+
+        createdCount++;
+      }
+
+      // Also sync catalog Product if exists
+      try {
+        const catProduct = await Product.findOne({
+          where: { sku },
+          attributes: ['id', 'barcode', 'costPrice']
+        });
+        if (catProduct) {
+          const catUpdates = {};
+          if (barcode && (!catProduct.barcode || catProduct.barcode === catProduct.sku)) {
+            catUpdates.barcode = barcode;
+          }
+          if (costPrice > 0 && (!catProduct.costPrice || Number(catProduct.costPrice) === 0)) {
+            catUpdates.costPrice = costPrice;
+          }
+          if (Object.keys(catUpdates).length > 0) {
+            await catProduct.update(catUpdates).catch(() => {});
+          }
+        }
+      } catch (_) {}
+    }
+
+    res.json({
+      success: true,
+      message: `Import complete! ${createdCount} created, ${updatedCount} updated, ${skippedCount} skipped.`,
+      createdCount,
+      updatedCount,
+      skippedCount,
+      totalProcessed: items.length
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   list,
   scan,
+  bulkImport,
   matchAlternative,
   matchBundle,
   createProduct,
